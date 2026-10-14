@@ -22,6 +22,8 @@
 #include <cstdint>
 
 #include <functional>
+#include <map>
+#include <optional>
 #include <unordered_map>
 
 /**
@@ -91,6 +93,41 @@ public:
 
 struct CCoinsCacheEntry;
 using CoinsCachePair = std::pair<const COutPoint, CCoinsCacheEntry>;
+
+/**
+ * Favilla: a burn-claim nullifier entry (SPEC §8).
+ * Keyed by burn txid (32 bytes, internal byte order). The value records the
+ * claiming Favilla height and the transaction index within that block, for
+ * auditability. Serialized as: claim_height uint32 LE || tx_index uint32 LE.
+ */
+struct NullifierEntry {
+    uint32_t claim_height{0};
+    uint32_t tx_index{0};
+
+    SERIALIZE_METHODS(NullifierEntry, obj) { READWRITE(obj.claim_height, obj.tx_index); }
+
+    friend bool operator==(const NullifierEntry& a, const NullifierEntry& b)
+    {
+        return a.claim_height == b.claim_height && a.tx_index == b.tx_index;
+    }
+};
+
+/**
+ * Favilla: a set of nullifier writes to be applied atomically with a coins
+ * batch write. A nullopt value is a tombstone (delete the key).
+ */
+using NullifierMap = std::map<uint256, std::optional<NullifierEntry>>;
+
+/**
+ * Favilla: the burn's Bitcoin median-time-past recorded for each Vigil mint
+ * output at claim time (SPEC §11.1, D13d). Keyed by the mint outpoint
+ * (claim txid, vout 0); value is burn_mtp as uint32 LE. A nullopt value is
+ * a tombstone (delete the key). Entries are written when a claim connects
+ * and erased when the claim block disconnects (reorg); they are never
+ * erased on spend (a spent outpoint can never be re-spent, and the entry
+ * is only ever consulted for coins present in the UTXO set).
+ */
+using VigilMtpMap = std::map<COutPoint, std::optional<uint32_t>>;
 
 /**
  * A Coin in one level of the coins database caching hierarchy.
@@ -330,7 +367,23 @@ public:
 
     //! Do a bulk modification (multiple Coin changes + BestBlock change).
     //! The passed cursor is used to iterate through the coins.
-    virtual void BatchWrite(CoinsViewCacheCursor& cursor, const uint256& hashBlock);
+    //! Favilla: nullifier and Vigil-MTP writes ride in the same call so they
+    //! land in the same database batch as the UTXO updates (SPEC §8: atomic
+    //! insert; §11.1 D13d: burn_mtp recorded at claim time).
+    virtual void BatchWrite(CoinsViewCacheCursor& cursor, const uint256& hashBlock,
+                            const NullifierMap& nullifiers, const VigilMtpMap& vigilMtps);
+
+    //! Favilla: look up a burn-claim nullifier by burn txid. Returns nullopt
+    //! if the burn has never been claimed on the active chain.
+    virtual std::optional<NullifierEntry> GetNullifier(const uint256& burn_txid) const;
+
+    //! Favilla: true iff the burn txid is present in the nullifier set.
+    virtual bool HaveNullifier(const uint256& burn_txid) const;
+
+    //! Favilla: look up the burn's Bitcoin MTP recorded for a Vigil mint
+    //! outpoint at claim time (SPEC §11.1, D13d). Returns nullopt if the
+    //! outpoint is not a recorded Vigil mint.
+    virtual std::optional<uint32_t> GetVigilMtp(const COutPoint& outpoint) const;
 
     //! Get a cursor to iterate over the whole state
     virtual std::unique_ptr<CCoinsViewCursor> Cursor() const;
@@ -357,7 +410,11 @@ public:
     uint256 GetBestBlock() const override;
     std::vector<uint256> GetHeadBlocks() const override;
     void SetBackend(CCoinsView &viewIn);
-    void BatchWrite(CoinsViewCacheCursor& cursor, const uint256& hashBlock) override;
+    void BatchWrite(CoinsViewCacheCursor& cursor, const uint256& hashBlock,
+                    const NullifierMap& nullifiers, const VigilMtpMap& vigilMtps) override;
+    std::optional<NullifierEntry> GetNullifier(const uint256& burn_txid) const override;
+    bool HaveNullifier(const uint256& burn_txid) const override;
+    std::optional<uint32_t> GetVigilMtp(const COutPoint& outpoint) const override;
     std::unique_ptr<CCoinsViewCursor> Cursor() const override;
     size_t EstimateSize() const override;
 };
@@ -379,6 +436,21 @@ protected:
     /* The starting sentinel of the flagged entry circular doubly linked list. */
     mutable CoinsCachePair m_sentinel;
     mutable CCoinsMap cacheCoins;
+
+    /**
+     * Favilla: cached burn-claim nullifier writes (SPEC §8). Every entry in
+     * this map is dirty by construction: it is populated only by
+     * AddNullifier/EraseNullifier and drained by Flush()/Sync() into the
+     * base view. A nullopt value is a tombstone (delete on flush).
+     */
+    mutable NullifierMap cacheNullifiers;
+
+    /**
+     * Favilla: cached Vigil mint burn-MTP writes (SPEC §11.1, D13d). Same
+     * dirty-by-construction / tombstone discipline as cacheNullifiers;
+     * populated by AddVigilMtp/EraseVigilMtp, drained by Flush()/Sync().
+     */
+    mutable VigilMtpMap cacheVigilMtps;
 
     /* Cached dynamic memory usage for the inner Coin objects. */
     mutable size_t cachedCoinsUsage{0};
@@ -408,10 +480,26 @@ public:
     bool HaveCoin(const COutPoint &outpoint) const override;
     uint256 GetBestBlock() const override;
     void SetBestBlock(const uint256 &hashBlock);
-    void BatchWrite(CoinsViewCacheCursor& cursor, const uint256& hashBlock) override;
+    void BatchWrite(CoinsViewCacheCursor& cursor, const uint256& hashBlock,
+                    const NullifierMap& nullifiers, const VigilMtpMap& vigilMtps) override;
+    std::optional<NullifierEntry> GetNullifier(const uint256& burn_txid) const override;
+    bool HaveNullifier(const uint256& burn_txid) const override;
+    std::optional<uint32_t> GetVigilMtp(const COutPoint& outpoint) const override;
     std::unique_ptr<CCoinsViewCursor> Cursor() const override {
         throw std::logic_error("CCoinsViewCache cursor iteration not supported.");
     }
+
+    /** Favilla: record a burn txid as claimed (SPEC §8 V1). */
+    void AddNullifier(const uint256& burn_txid, const NullifierEntry& entry);
+
+    /** Favilla: remove a burn txid from the nullifier set (reorg undo, SPEC §13.1). */
+    void EraseNullifier(const uint256& burn_txid);
+
+    /** Favilla: record a Vigil mint output's burn Bitcoin MTP (SPEC §11.1, D13d). */
+    void AddVigilMtp(const COutPoint& outpoint, uint32_t burn_mtp);
+
+    /** Favilla: remove a Vigil mint's burn-MTP record (claim-block disconnect). */
+    void EraseVigilMtp(const COutPoint& outpoint);
 
     /**
      * Check if we have the given utxo already loaded in this cache.

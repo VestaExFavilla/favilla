@@ -331,6 +331,19 @@ public:
     void removeForReorg(CChain& chain, std::function<bool(txiter)> filter_final_and_mature) EXCLUSIVE_LOCKS_REQUIRED(cs, cs_main);
     void removeForBlock(const std::vector<CTransactionRef>& vtx, unsigned int nBlockHeight) EXCLUSIVE_LOCKS_REQUIRED(cs);
 
+    /**
+     * Favilla: true iff the mempool currently holds a version-4 claim for the
+     * given burn txid (SPEC §10 policy: at most one mempool claim per burn).
+     */
+    bool HasClaimForBurn(const uint256& burn_txid) const EXCLUSIVE_LOCKS_REQUIRED(cs);
+
+    /**
+     * Favilla: evict every version-4 claim from the mempool (SPEC §10: claims
+     * are valid for exactly one height, so all mempool claims are dropped
+     * when the chain tip advances).
+     */
+    void removeClaims() EXCLUSIVE_LOCKS_REQUIRED(cs);
+
     bool CompareMiningScoreWithTopology(const Wtxid& hasha, const Wtxid& hashb) const;
     bool isSpent(const COutPoint& outpoint) const;
     unsigned int GetTransactionsUpdated() const;

@@ -18,10 +18,21 @@ std::optional<Coin> CCoinsView::GetCoin(const COutPoint& outpoint) const { retur
 std::optional<Coin> CCoinsView::PeekCoin(const COutPoint& outpoint) const { return GetCoin(outpoint); }
 uint256 CCoinsView::GetBestBlock() const { return uint256(); }
 std::vector<uint256> CCoinsView::GetHeadBlocks() const { return std::vector<uint256>(); }
-void CCoinsView::BatchWrite(CoinsViewCacheCursor& cursor, const uint256& hashBlock)
+void CCoinsView::BatchWrite(CoinsViewCacheCursor& cursor, const uint256& hashBlock,
+                             const NullifierMap& nullifiers, const VigilMtpMap& vigilMtps)
 {
     for (auto it{cursor.Begin()}; it != cursor.End(); it = cursor.NextAndMaybeErase(*it)) { }
+    if (!nullifiers.empty()) {
+        throw std::logic_error("CCoinsView::BatchWrite: nullifier writes not supported by this view");
+    }
+    if (!vigilMtps.empty()) {
+        throw std::logic_error("CCoinsView::BatchWrite: Vigil-MTP writes not supported by this view");
+    }
 }
+
+std::optional<NullifierEntry> CCoinsView::GetNullifier(const uint256& burn_txid) const { return std::nullopt; }
+bool CCoinsView::HaveNullifier(const uint256& burn_txid) const { return GetNullifier(burn_txid).has_value(); }
+std::optional<uint32_t> CCoinsView::GetVigilMtp(const COutPoint& outpoint) const { return std::nullopt; }
 
 std::unique_ptr<CCoinsViewCursor> CCoinsView::Cursor() const { return nullptr; }
 
@@ -37,7 +48,11 @@ bool CCoinsViewBacked::HaveCoin(const COutPoint &outpoint) const { return base->
 uint256 CCoinsViewBacked::GetBestBlock() const { return base->GetBestBlock(); }
 std::vector<uint256> CCoinsViewBacked::GetHeadBlocks() const { return base->GetHeadBlocks(); }
 void CCoinsViewBacked::SetBackend(CCoinsView &viewIn) { base = &viewIn; }
-void CCoinsViewBacked::BatchWrite(CoinsViewCacheCursor& cursor, const uint256& hashBlock) { base->BatchWrite(cursor, hashBlock); }
+void CCoinsViewBacked::BatchWrite(CoinsViewCacheCursor& cursor, const uint256& hashBlock,
+                                   const NullifierMap& nullifiers, const VigilMtpMap& vigilMtps) { base->BatchWrite(cursor, hashBlock, nullifiers, vigilMtps); }
+std::optional<NullifierEntry> CCoinsViewBacked::GetNullifier(const uint256& burn_txid) const { return base->GetNullifier(burn_txid); }
+bool CCoinsViewBacked::HaveNullifier(const uint256& burn_txid) const { return base->HaveNullifier(burn_txid); }
+std::optional<uint32_t> CCoinsViewBacked::GetVigilMtp(const COutPoint& outpoint) const { return base->GetVigilMtp(outpoint); }
 std::unique_ptr<CCoinsViewCursor> CCoinsViewBacked::Cursor() const { return base->Cursor(); }
 size_t CCoinsViewBacked::EstimateSize() const { return base->EstimateSize(); }
 
@@ -205,8 +220,20 @@ void CCoinsViewCache::SetBestBlock(const uint256 &hashBlockIn) {
     hashBlock = hashBlockIn;
 }
 
-void CCoinsViewCache::BatchWrite(CoinsViewCacheCursor& cursor, const uint256& hashBlockIn)
+void CCoinsViewCache::BatchWrite(CoinsViewCacheCursor& cursor, const uint256& hashBlockIn,
+                                  const NullifierMap& nullifiers, const VigilMtpMap& vigilMtps)
 {
+    // Favilla: merge the child's nullifier and Vigil-MTP writes into this
+    // cache. Entries are only ever created in the topmost view
+    // (ConnectBlock / DisconnectBlock) and drained downward by Flush()/Sync(),
+    // so a plain overwrite-merge preserves the invariant that these maps
+    // hold exactly the not-yet-persisted writes.
+    for (const auto& [burn_txid, entry] : nullifiers) {
+        cacheNullifiers[burn_txid] = entry;
+    }
+    for (const auto& [outpoint, mtp] : vigilMtps) {
+        cacheVigilMtps[outpoint] = mtp;
+    }
     for (auto it{cursor.Begin()}; it != cursor.End(); it = cursor.NextAndMaybeErase(*it)) {
         if (!it->second.IsDirty()) { // TODO a cursor can only contain dirty entries
             continue;
@@ -279,7 +306,15 @@ void CCoinsViewCache::BatchWrite(CoinsViewCacheCursor& cursor, const uint256& ha
 void CCoinsViewCache::Flush(bool reallocate_cache)
 {
     auto cursor{CoinsViewCacheCursor(m_dirty_count, m_sentinel, cacheCoins, /*will_erase=*/true)};
-    base->BatchWrite(cursor, hashBlock);
+    // Favilla: drain the nullifier and Vigil-MTP writes into the base view
+    // in the same call so the DB layer can persist them in the same batch
+    // as the coins. Copy (not swap): if BatchWrite throws, the writes stay
+    // cached.
+    const NullifierMap nullifiers{cacheNullifiers};
+    const VigilMtpMap vigilMtps{cacheVigilMtps};
+    base->BatchWrite(cursor, hashBlock, nullifiers, vigilMtps);
+    cacheNullifiers.clear();
+    cacheVigilMtps.clear();
     Assume(m_dirty_count == 0);
     cacheCoins.clear();
     if (reallocate_cache) {
@@ -291,7 +326,11 @@ void CCoinsViewCache::Flush(bool reallocate_cache)
 void CCoinsViewCache::Sync()
 {
     auto cursor{CoinsViewCacheCursor(m_dirty_count, m_sentinel, cacheCoins, /*will_erase=*/false)};
-    base->BatchWrite(cursor, hashBlock);
+    const NullifierMap nullifiers{cacheNullifiers};
+    const VigilMtpMap vigilMtps{cacheVigilMtps};
+    base->BatchWrite(cursor, hashBlock, nullifiers, vigilMtps);
+    cacheNullifiers.clear();
+    cacheVigilMtps.clear();
     Assume(m_dirty_count == 0);
     if (m_sentinel.second.Next() != &m_sentinel) {
         /* BatchWrite must clear flags of all entries */
@@ -299,9 +338,56 @@ void CCoinsViewCache::Sync()
     }
 }
 
+std::optional<NullifierEntry> CCoinsViewCache::GetNullifier(const uint256& burn_txid) const
+{
+    if (auto it{cacheNullifiers.find(burn_txid)}; it != cacheNullifiers.end()) {
+        return it->second; // may be nullopt: tombstone (deleted, not yet flushed)
+    }
+    return base->GetNullifier(burn_txid);
+}
+
+bool CCoinsViewCache::HaveNullifier(const uint256& burn_txid) const
+{
+    return GetNullifier(burn_txid).has_value();
+}
+
+void CCoinsViewCache::AddNullifier(const uint256& burn_txid, const NullifierEntry& entry)
+{
+    cacheNullifiers[burn_txid] = entry;
+}
+
+void CCoinsViewCache::EraseNullifier(const uint256& burn_txid)
+{
+    cacheNullifiers[burn_txid] = std::nullopt;
+}
+
+std::optional<uint32_t> CCoinsViewCache::GetVigilMtp(const COutPoint& outpoint) const
+{
+    if (auto it{cacheVigilMtps.find(outpoint)}; it != cacheVigilMtps.end()) {
+        return it->second; // may be nullopt: tombstone (deleted, not yet flushed)
+    }
+    return base->GetVigilMtp(outpoint);
+}
+
+void CCoinsViewCache::AddVigilMtp(const COutPoint& outpoint, uint32_t burn_mtp)
+{
+    cacheVigilMtps[outpoint] = burn_mtp;
+}
+
+void CCoinsViewCache::EraseVigilMtp(const COutPoint& outpoint)
+{
+    cacheVigilMtps[outpoint] = std::nullopt;
+}
+
 void CCoinsViewCache::Reset() noexcept
 {
     cacheCoins.clear();
+    // Audit M2: cacheNullifiers must be cleared too. Any future Reset with
+    // pending nullifier writes would otherwise silently carry stale
+    // nullifiers into the next flush, making burns permanently unclaimable.
+    cacheNullifiers.clear();
+    // Same discipline for the Vigil-MTP writes (D13d).
+    cacheVigilMtps.clear();
     cachedCoinsUsage = 0;
     m_dirty_count = 0;
     SetBestBlock(uint256::ZERO);

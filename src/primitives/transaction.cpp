@@ -64,7 +64,10 @@ std::string CTxOut::ToString() const
 }
 
 CMutableTransaction::CMutableTransaction() : version{CTransaction::CURRENT_VERSION}, nLockTime{0} {}
-CMutableTransaction::CMutableTransaction(const CTransaction& tx) : vin(tx.vin), vout(tx.vout), version{tx.version}, nLockTime{tx.nLockTime} {}
+CMutableTransaction::CMutableTransaction(const CTransaction& tx) : vin(tx.vin), vout(tx.vout), version{tx.version}, nLockTime{tx.nLockTime},
+    claim_burn_txid(tx.claim_burn_txid), claim_burn_header(tx.claim_burn_header),
+    claim_merkle_branch(tx.claim_merkle_branch), claim_merkle_index(tx.claim_merkle_index),
+    claim_burn_tx(tx.claim_burn_tx), claim_signature(tx.claim_signature) {}
 
 Txid CMutableTransaction::GetHash() const
 {
@@ -92,19 +95,33 @@ Wtxid CTransaction::ComputeWitnessHash() const
     return Wtxid::FromUint256((HashWriter{} << TX_WITH_WITNESS(*this)).GetHash());
 }
 
-CTransaction::CTransaction(const CMutableTransaction& tx) : vin(tx.vin), vout(tx.vout), version{tx.version}, nLockTime{tx.nLockTime}, m_has_witness{ComputeHasWitness()}, hash{ComputeHash()}, m_witness_hash{ComputeWitnessHash()} {}
-CTransaction::CTransaction(CMutableTransaction&& tx) : vin(std::move(tx.vin)), vout(std::move(tx.vout)), version{tx.version}, nLockTime{tx.nLockTime}, m_has_witness{ComputeHasWitness()}, hash{ComputeHash()}, m_witness_hash{ComputeWitnessHash()} {}
+CTransaction::CTransaction(const CMutableTransaction& tx) : vin(tx.vin), vout(tx.vout), version{tx.version}, nLockTime{tx.nLockTime},
+    claim_burn_txid(tx.claim_burn_txid), claim_burn_header(tx.claim_burn_header),
+    claim_merkle_branch(tx.claim_merkle_branch), claim_merkle_index(tx.claim_merkle_index),
+    claim_burn_tx(tx.claim_burn_tx), claim_signature(tx.claim_signature),
+    m_has_witness{ComputeHasWitness()}, hash{ComputeHash()}, m_witness_hash{ComputeWitnessHash()} {}
+CTransaction::CTransaction(CMutableTransaction&& tx) : vin(std::move(tx.vin)), vout(std::move(tx.vout)), version{tx.version}, nLockTime{tx.nLockTime},
+    claim_burn_txid(std::move(tx.claim_burn_txid)), claim_burn_header(std::move(tx.claim_burn_header)),
+    claim_merkle_branch(std::move(tx.claim_merkle_branch)), claim_merkle_index(tx.claim_merkle_index),
+    claim_burn_tx(std::move(tx.claim_burn_tx)), claim_signature(std::move(tx.claim_signature)),
+    m_has_witness{ComputeHasWitness()}, hash{ComputeHash()}, m_witness_hash{ComputeWitnessHash()} {}
 
 CAmount CTransaction::GetValueOut() const
 {
-    CAmount nValueOut = 0;
+    // Favilla: version-4 mint outputs are money-range-checked against int64
+    // (SPEC §9: no MAX_MONEY cap on mints), so accumulate in 128 bits and
+    // only enforce the int64 range here. For versions 1-2, CheckTransaction
+    // already rejects outputs above MAX_MONEY before this is reached in
+    // validation paths, so behaviour there is unchanged.
+    unsigned __int128 nValueOut = 0;
     for (const auto& tx_out : vout) {
-        if (!MoneyRange(tx_out.nValue) || !MoneyRange(nValueOut + tx_out.nValue))
+        if (tx_out.nValue < 0)
+            throw std::runtime_error(std::string(__func__) + ": negative output value");
+        nValueOut += static_cast<uint64_t>(tx_out.nValue);
+        if (nValueOut > static_cast<unsigned __int128>(std::numeric_limits<CAmount>::max()))
             throw std::runtime_error(std::string(__func__) + ": value out of range");
-        nValueOut += tx_out.nValue;
     }
-    assert(MoneyRange(nValueOut));
-    return nValueOut;
+    return static_cast<CAmount>(nValueOut);
 }
 
 unsigned int CTransaction::ComputeTotalSize() const

@@ -94,7 +94,8 @@ public:
 
     SERIALIZE_METHODS(CBlock, obj)
     {
-        READWRITE(AsBase<CBlockHeader>(obj), obj.vtx);
+        READWRITE(AsBase<CBlockHeader>(obj));
+        READWRITE(obj.vtx);
     }
 
     void SetNull()

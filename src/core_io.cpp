@@ -444,7 +444,10 @@ void TxToUniv(const CTransaction& tx, const uint256& block_hash, UniValue& entry
 
     // If available, use Undo data to calculate the fee. Note that txundo == nullptr
     // for coinbase transactions and for transactions where undo data is unavailable.
-    const bool have_undo = txundo != nullptr;
+    // Favilla: version-4 claims carry an (empty) undo entry but spend no
+    // inputs — indexing vprevout would read out of bounds (this crashed
+    // getblock verbosity 2 on claim blocks). Claims never use undo data.
+    const bool have_undo = txundo != nullptr && !tx.IsClaim();
     CAmount amt_total_in = 0;
     CAmount amt_total_out = 0;
 

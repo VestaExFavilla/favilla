@@ -18,6 +18,8 @@
 #include <core_io.h>
 #include <deploymentinfo.h>
 #include <deploymentstatus.h>
+#include <favilla/btcheaders.h>
+#include <favilla/favilla.h>
 #include <flatfile.h>
 #include <hash.h>
 #include <index/blockfilterindex.h>
@@ -3493,6 +3495,242 @@ return RPCHelpMan{
     };
 }
 
+// Favilla: submit a Bitcoin block header to the node's Bitcoin header chain
+// (SPEC §6). The header's PoW is checked against its own nBits and the
+// difficulty-bits linkage follows the parent chain's consensus rules, which
+// depend on the Favilla chain type: Bitcoin-regtest rules on Favilla regtest
+// (constant nBits, no retargeting), genuine Bitcoin-testnet4 rules on Favilla
+// testnet (full 2016-block retargeting, BIP94 min-difficulty blocks; the
+// first header must be the genuine testnet4 genesis). The header must
+// connect to the known chain; side branches are kept and the most-work chain
+// is active (SPEC §6).
+
+// Favilla D13b: after new Bitcoin headers arrive, re-attempt validation of
+// any blocks held as not-yet-validated (their committed tip may now be
+// known). Held blocks were stored but never marked invalid, so a plain
+// chain activation retries them.
+static void MaybeRetryHeldBlocks(const JSONRPCRequest& request)
+{
+    if (!Favilla::ConsumeHeldBlocks()) return;
+    const NodeContext& node = EnsureAnyNodeContext(request.context);
+    ChainstateManager& chainman = EnsureChainman(node);
+    BlockValidationState state;
+    WITH_LOCK(cs_main, chainman.ActiveChainstate().ActivateBestChain(state));
+}
+
+static RPCHelpMan submitbitcoinheader()
+{
+    return RPCHelpMan{
+        "submitbitcoinheader",
+        "Submit a Bitcoin block header (hex, 80 bytes) to the node's Bitcoin header chain.\n"
+                "Favilla full nodes maintain a validated Bitcoin header chain used for burn-claim\n"
+                "depth checks (144 confirmations). The header must connect to the known chain;\n"
+                "proof of work is verified on submission, and the difficulty-bits linkage must\n"
+                "follow the parent chain's consensus rules for this Favilla chain type\n"
+                "(Bitcoin-regtest rules on regtest; genuine Bitcoin-testnet4 rules on testnet,\n"
+                "where the first header must be the real testnet4 genesis).\n",
+                {
+                    {"header", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "80-byte Bitcoin block header, hex-encoded"},
+                },
+                {
+                    RPCResult{RPCResult::Type::OBJ, "", "",
+                        {
+                            {RPCResult::Type::STR_HEX, "hash", "the header hash"},
+                            {RPCResult::Type::NUM, "height", "height on the active Bitcoin header chain (-1 if not on active chain)"},
+                            {RPCResult::Type::NUM, "tip_height", "height of the active Bitcoin header tip (-1 if empty)"},
+                        }},
+                },
+                RPCExamples{
+                    HelpExampleCli("submitbitcoinheader", "\"<80-byte header hex>\"")
+            + HelpExampleRpc("submitbitcoinheader", "\"<80-byte header hex>\"")
+                },
+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
+{
+    const std::vector<unsigned char> header_bytes{ParseHexV(request.params[0], "header")};
+    if (header_bytes.size() != 80) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "header must be 80 bytes");
+    }
+    CBlockHeader header;
+    try {
+        DataStream ds{std::as_bytes(std::span{header_bytes})};
+        ds >> header;
+    } catch (const std::exception&) {
+        throw JSONRPCError(RPC_DESERIALIZATION_ERROR, "header does not deserialize");
+    }
+    std::string err;
+    if (!g_btcHeaderChain.AddHeader(header, err)) {
+        throw JSONRPCError(RPC_VERIFY_ERROR, strprintf("header rejected: %s", err));
+    }
+    const uint256 hash{header.GetHash()};
+    UniValue ret{UniValue::VOBJ};
+    ret.pushKV("hash", hash.GetHex());
+    ret.pushKV("height", g_btcHeaderChain.GetActiveHeight(hash));
+    ret.pushKV("tip_height", g_btcHeaderChain.GetTipHeight());
+    // D13b: the new header may be the committed tip of a held block.
+    MaybeRetryHeldBlocks(request);
+    return ret;
+},
+    };
+}
+
+// Favilla: inspect the node's Bitcoin header chain (SPEC §6).
+static RPCHelpMan getbitcoinheaderchaininfo()
+{
+    return RPCHelpMan{
+        "getbitcoinheaderchaininfo",
+        "Return information about the node's validated Bitcoin header chain\n"
+                "(used for burn-claim depth checks).\n",
+                {},
+                {
+                    RPCResult{RPCResult::Type::OBJ, "", "",
+                        {
+                            {RPCResult::Type::NUM, "headers", "number of Bitcoin headers stored"},
+                            {RPCResult::Type::NUM, "tip_height", "height of the active Bitcoin header tip (-1 if empty)"},
+                            {RPCResult::Type::STR_HEX, "tip_hash", "hash of the active Bitcoin header tip (empty if none)"},
+                        }},
+                },
+                RPCExamples{
+                    HelpExampleCli("getbitcoinheaderchaininfo", "")
+            + HelpExampleRpc("getbitcoinheaderchaininfo", "")
+                },
+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
+{
+    UniValue ret{UniValue::VOBJ};
+    ret.pushKV("headers", static_cast<uint64_t>(g_btcHeaderChain.Size()));
+    ret.pushKV("tip_height", g_btcHeaderChain.GetTipHeight());
+    ret.pushKV("tip_hash", g_btcHeaderChain.GetTipHash().GetHex());
+    return ret;
+},
+    };
+}
+
+// Favilla: export the node's Bitcoin header chain as a hex blob (audit H2).
+// A fresh node imports the blob with importbitcoinheaders to bootstrap
+// without replaying every submission. The blob is the DataStream
+// serialization of std::vector<CBlockHeader> in height order (active chain
+// AND side branches) — the same format as favilla_btcheaders.dat on disk.
+static RPCHelpMan exportbitcoinheaders()
+{
+    return RPCHelpMan{
+        "exportbitcoinheaders",
+        "Export the node's validated Bitcoin header chain as a hex blob, for\n"
+                "bootstrapping other nodes via importbitcoinheaders.\n",
+                {},
+                {
+                    RPCResult{RPCResult::Type::OBJ, "", "",
+                        {
+                            {RPCResult::Type::NUM, "headers", "number of Bitcoin headers exported"},
+                            {RPCResult::Type::STR_HEX, "blob", "hex-encoded serialized header chain (height order)"},
+                        }},
+                },
+                RPCExamples{
+                    HelpExampleCli("exportbitcoinheaders", "")
+            + HelpExampleRpc("exportbitcoinheaders", "")
+                },
+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
+{
+    const std::vector<CBlockHeader> headers{g_btcHeaderChain.GetHeadersByHeight()};
+    DataStream ds;
+    ds << headers;
+    UniValue ret{UniValue::VOBJ};
+    ret.pushKV("headers", static_cast<uint64_t>(headers.size()));
+    ret.pushKV("blob", HexStr(std::as_bytes(std::span{ds.data(), ds.size()})));
+    return ret;
+},
+    };
+}
+
+// Favilla: import a header-chain blob produced by exportbitcoinheaders
+// (audit H2). Headers are validated under the same rules as
+// submitbitcoinheader; the import stops at the first invalid header.
+static RPCHelpMan importbitcoinheaders()
+{
+    return RPCHelpMan{
+        "importbitcoinheaders",
+        "Import a Bitcoin header-chain blob produced by exportbitcoinheaders.\n"
+                "Used to bootstrap a fresh node's header chain without replaying\n"
+                "every individual submission.\n",
+                {
+                    {"blob", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "hex-encoded serialized header chain from exportbitcoinheaders"},
+                },
+                {
+                    RPCResult{RPCResult::Type::OBJ, "", "",
+                        {
+                            {RPCResult::Type::NUM, "processed", "headers in the blob that were accepted (re-submissions of known headers count)"},
+                            {RPCResult::Type::NUM, "headers", "total headers stored after import"},
+                            {RPCResult::Type::NUM, "tip_height", "height of the active Bitcoin header tip"},
+                            {RPCResult::Type::STR_HEX, "tip_hash", "hash of the active Bitcoin header tip"},
+                        }},
+                },
+                RPCExamples{
+                    HelpExampleCli("importbitcoinheaders", "\"<blob>\"")
+            + HelpExampleRpc("importbitcoinheaders", "\"<blob>\"")
+                },
+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
+{
+    const std::vector<unsigned char> blob{ParseHexV(request.params[0], "blob")};
+    std::vector<CBlockHeader> headers;
+    try {
+        DataStream ds{std::as_bytes(std::span{blob})};
+        ds >> headers;
+    } catch (const std::exception&) {
+        throw JSONRPCError(RPC_DESERIALIZATION_ERROR, "blob does not deserialize as a header chain");
+    }
+    uint64_t processed{0};
+    for (const CBlockHeader& header : headers) {
+        std::string err;
+        if (!g_btcHeaderChain.AddHeader(header, err)) {
+            throw JSONRPCError(RPC_VERIFY_ERROR,
+                               strprintf("header %llu of %llu rejected: %s",
+                                         processed, (uint64_t)headers.size(), err));
+        }
+        ++processed;
+    }
+    UniValue ret{UniValue::VOBJ};
+    ret.pushKV("processed", processed);
+    ret.pushKV("headers", static_cast<uint64_t>(g_btcHeaderChain.Size()));
+    ret.pushKV("tip_height", g_btcHeaderChain.GetTipHeight());
+    ret.pushKV("tip_hash", g_btcHeaderChain.GetTipHash().GetHex());
+    // D13b: the imported headers may include a held block's committed tip.
+    MaybeRetryHeldBlocks(request);
+    return ret;
+},
+    };
+}
+
+// Favilla: escape hatch for an orphaned/invalid Bitcoin header tip (audit
+// M1). Clears the in-memory chain AND the on-disk file; the node then
+// accepts a fresh anchor (on testnet: the genuine testnet4 genesis).
+static RPCHelpMan clearbitcoinheaders()
+{
+    return RPCHelpMan{
+        "clearbitcoinheaders",
+        "Clear the node's entire Bitcoin header chain (memory and disk).\n"
+                "Escape hatch for an orphaned or invalid tip; the chain must be\n"
+                "rebuilt afterwards via submitbitcoinheader or\n"
+                "importbitcoinheaders. All claims fail closed until the chain\n"
+                "reaches 144 headers.\n",
+                {},
+                {
+                    RPCResult{RPCResult::Type::OBJ, "", "",
+                        {
+                            {RPCResult::Type::BOOL, "cleared", "always true"},
+                        }},
+                },
+                RPCExamples{
+                    HelpExampleCli("clearbitcoinheaders", "")
+            + HelpExampleRpc("clearbitcoinheaders", "")
+                },
+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
+{
+    g_btcHeaderChain.Clear();
+    UniValue ret{UniValue::VOBJ};
+    ret.pushKV("cleared", true);
+    return ret;
+},
+    };
+}
+
 
 void RegisterBlockchainRPCCommands(CRPCTable& t)
 {
@@ -3521,6 +3759,11 @@ void RegisterBlockchainRPCCommands(CRPCTable& t)
         {"blockchain", &dumptxoutset},
         {"blockchain", &loadtxoutset},
         {"blockchain", &getchainstates},
+        {"blockchain", &submitbitcoinheader},
+        {"blockchain", &getbitcoinheaderchaininfo},
+        {"blockchain", &exportbitcoinheaders},
+        {"blockchain", &importbitcoinheaders},
+        {"blockchain", &clearbitcoinheaders},
         {"hidden", &invalidateblock},
         {"hidden", &reconsiderblock},
         {"blockchain", &waitfornewblock},

@@ -27,6 +27,11 @@
 static constexpr uint8_t DB_COIN{'C'};
 static constexpr uint8_t DB_BEST_BLOCK{'B'};
 static constexpr uint8_t DB_HEAD_BLOCKS{'H'};
+// Favilla: burn-claim nullifier set (SPEC §8). Key: ('N', burn_txid).
+static constexpr uint8_t DB_NULLIFIER{'N'};
+// Favilla: Vigil mint burn-MTP records (SPEC §11.1, D13d).
+// Key: ('V', outpoint); value: burn_mtp uint32 LE.
+static constexpr uint8_t DB_VIGIL_MTP{'V'};
 // Keys used in previous version that might still be found in the DB:
 static constexpr uint8_t DB_COINS{'c'};
 
@@ -50,6 +55,24 @@ struct CoinEntry {
     explicit CoinEntry(const COutPoint* ptr) : outpoint(const_cast<COutPoint*>(ptr)) {}
 
     SERIALIZE_METHODS(CoinEntry, obj) { READWRITE(obj.key, obj.outpoint->hash, VARINT(obj.outpoint->n)); }
+};
+
+// Favilla: nullifier DB key ('N', burn_txid).
+struct NullifierEntryKey {
+    const uint256* burn_txid;
+    uint8_t key{DB_NULLIFIER};
+    explicit NullifierEntryKey(const uint256* ptr) : burn_txid(ptr) {}
+
+    SERIALIZE_METHODS(NullifierEntryKey, obj) { READWRITE(obj.key, *obj.burn_txid); }
+};
+
+// Favilla: Vigil-MTP DB key ('V', outpoint) — D13d burn_mtp records.
+struct VigilMtpKey {
+    const COutPoint* outpoint;
+    uint8_t key{DB_VIGIL_MTP};
+    explicit VigilMtpKey(const COutPoint* ptr) : outpoint(ptr) {}
+
+    SERIALIZE_METHODS(VigilMtpKey, obj) { READWRITE(obj.key, obj.outpoint->hash, VARINT(obj.outpoint->n)); }
 };
 
 } // namespace
@@ -97,6 +120,24 @@ bool CCoinsViewDB::HaveCoin(const COutPoint &outpoint) const {
     return m_db->Exists(CoinEntry(&outpoint));
 }
 
+std::optional<NullifierEntry> CCoinsViewDB::GetNullifier(const uint256& burn_txid) const
+{
+    NullifierEntry entry;
+    if (m_db->Read(NullifierEntryKey(&burn_txid), entry)) {
+        return entry;
+    }
+    return std::nullopt;
+}
+
+std::optional<uint32_t> CCoinsViewDB::GetVigilMtp(const COutPoint& outpoint) const
+{
+    uint32_t burn_mtp{0};
+    if (m_db->Read(VigilMtpKey(&outpoint), burn_mtp)) {
+        return burn_mtp;
+    }
+    return std::nullopt;
+}
+
 uint256 CCoinsViewDB::GetBestBlock() const {
     uint256 hashBestChain;
     if (!m_db->Read(DB_BEST_BLOCK, hashBestChain))
@@ -112,7 +153,8 @@ std::vector<uint256> CCoinsViewDB::GetHeadBlocks() const {
     return vhashHeadBlocks;
 }
 
-void CCoinsViewDB::BatchWrite(CoinsViewCacheCursor& cursor, const uint256& hashBlock)
+void CCoinsViewDB::BatchWrite(CoinsViewCacheCursor& cursor, const uint256& hashBlock,
+                               const NullifierMap& nullifiers, const VigilMtpMap& vigilMtps)
 {
     CDBBatch batch(*m_db);
     size_t count = 0;
@@ -166,6 +208,26 @@ void CCoinsViewDB::BatchWrite(CoinsViewCacheCursor& cursor, const uint256& hashB
                     _Exit(0);
                 }
             }
+        }
+    }
+
+    // Favilla: nullifier writes land in the same batch as the coins (SPEC §8:
+    // atomic insert with the UTXO updates). Tombstones (nullopt) erase.
+    for (const auto& [burn_txid, entry] : nullifiers) {
+        if (entry.has_value()) {
+            batch.Write(NullifierEntryKey(&burn_txid), *entry);
+        } else {
+            batch.Erase(NullifierEntryKey(&burn_txid));
+        }
+    }
+
+    // Favilla: Vigil mint burn-MTP records (SPEC §11.1, D13d) ride in the
+    // same batch. Tombstones (nullopt) erase.
+    for (const auto& [outpoint, mtp] : vigilMtps) {
+        if (mtp.has_value()) {
+            batch.Write(VigilMtpKey(&outpoint), *mtp);
+        } else {
+            batch.Erase(VigilMtpKey(&outpoint));
         }
     }
 

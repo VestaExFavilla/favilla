@@ -8,10 +8,12 @@
 
 #include <attributes.h>
 #include <consensus/amount.h>
+#include <favilla/favilla.h>
 #include <primitives/transaction_identifier.h> // IWYU pragma: export
 #include <script/script.h>
 #include <serialize.h>
 
+#include <array>
 #include <compare>
 #include <cstddef>
 #include <cstdint>
@@ -197,12 +199,58 @@ static constexpr TransactionSerParams TX_NO_WITNESS{.allow_witness = false};
  *   - CScriptWitness scriptWitness; (deserialized into CTxIn)
  * - uint32_t nLockTime
  */
+/**
+ * (De)serialize the Favilla burn-claim evidence fields (SPEC §5). The layout is
+ * fixed: marker input, burn_txid, 80-byte burn header, merkle branch,
+ * merkle index, raw burn tx, claim signature (DER, 8..73 bytes), nLockTime,
+ * single mint output. There is never any witness data: a version-4
+ * transaction carrying witness marker/flag bytes cannot be produced by this
+ * grammar and is MALFORMED (M1).
+ *
+ * The claim signature authorizes the claim: it MUST be a DER-encoded ECDSA
+ * signature made with the private key behind the burn transaction's first
+ * input, over SHA256("FVLA-CLAIM" || network_magic || burn_txid) (SPEC §7
+ * V5). It is message authorization, not a transaction signature — the claim
+ * has no spendable inputs to sign for.
+ */
+template<typename Stream, typename TxType>
+void UnserializeClaimFields(TxType& tx, Stream& s)
+{
+    s >> tx.vin;
+    s >> tx.claim_burn_txid;
+    s >> tx.claim_burn_header;
+    s >> tx.claim_merkle_branch;
+    s >> tx.claim_merkle_index;
+    s >> tx.claim_burn_tx;
+    s >> tx.claim_signature;
+    s >> tx.nLockTime;
+    s >> tx.vout;
+}
+
+template<typename Stream, typename TxType>
+void SerializeClaimFields(const TxType& tx, Stream& s)
+{
+    s << tx.vin;
+    s << tx.claim_burn_txid;
+    s << tx.claim_burn_header;
+    s << tx.claim_merkle_branch;
+    s << tx.claim_merkle_index;
+    s << tx.claim_burn_tx;
+    s << tx.claim_signature;
+    s << tx.nLockTime;
+    s << tx.vout;
+}
+
 template<typename Stream, typename TxType>
 void UnserializeTransaction(TxType& tx, Stream& s, const TransactionSerParams& params)
 {
     const bool fAllowWitness = params.allow_witness;
 
     s >> tx.version;
+    if (tx.version == Favilla::TX_VERSION_CLAIM) {
+        UnserializeClaimFields(tx, s);
+        return;
+    }
     unsigned char flags = 0;
     tx.vin.clear();
     tx.vout.clear();
@@ -243,6 +291,11 @@ void SerializeTransaction(const TxType& tx, Stream& s, const TransactionSerParam
     const bool fAllowWitness = params.allow_witness;
 
     s << tx.version;
+    if (tx.version == Favilla::TX_VERSION_CLAIM) {
+        // Claims never carry witness data (SPEC §5: witness bytes => MALFORMED).
+        SerializeClaimFields(tx, s);
+        return;
+    }
     unsigned char flags = 0;
     // Consistency check
     if (fAllowWitness) {
@@ -293,6 +346,18 @@ public:
     const uint32_t version;
     const uint32_t nLockTime;
 
+    // Favilla: version-4 burn-claim evidence fields (SPEC §5). Only meaningful
+    // when version == Favilla::TX_VERSION_CLAIM; serialized by
+    // SerializeClaimFields/UnserializeClaimFields instead of the regular
+    // vin/vout layout. The single vin entry is the marker input (never
+    // executed, spends no UTXO).
+    const uint256 claim_burn_txid;
+    const std::array<unsigned char, 80> claim_burn_header; //!< raw 80-byte Bitcoin header
+    const std::vector<uint256> claim_merkle_branch;
+    const uint32_t claim_merkle_index;
+    const std::vector<unsigned char> claim_burn_tx; //!< raw Bitcoin burn transaction
+    const std::vector<unsigned char> claim_signature; //!< 65-byte compact recoverable Bitcoin Signed Message sig by burn input-0 key (SPEC §7 V5)
+
 private:
     /** Memory only. */
     const bool m_has_witness;
@@ -340,7 +405,16 @@ public:
 
     bool IsCoinBase() const
     {
-        return (vin.size() == 1 && vin[0].prevout.IsNull());
+        // A version-4 claim carries the marker input (null prevout) but is
+        // never a coinbase: position 0 is reserved for the real coinbase and
+        // claims must not be treated as one (SPEC §5).
+        return (vin.size() == 1 && vin[0].prevout.IsNull() && !IsClaim());
+    }
+
+    /** Favilla: true for version-4 burn-claim transactions (SPEC §5). */
+    bool IsClaim() const
+    {
+        return version == Favilla::TX_VERSION_CLAIM;
     }
 
     friend bool operator==(const CTransaction& a, const CTransaction& b)
@@ -360,6 +434,14 @@ struct CMutableTransaction
     std::vector<CTxOut> vout;
     uint32_t version;
     uint32_t nLockTime;
+
+    // Favilla: version-4 burn-claim evidence fields (SPEC §5); see CTransaction.
+    uint256 claim_burn_txid;
+    std::array<unsigned char, 80> claim_burn_header{};
+    std::vector<uint256> claim_merkle_branch;
+    uint32_t claim_merkle_index{0};
+    std::vector<unsigned char> claim_burn_tx;
+    std::vector<unsigned char> claim_signature;
 
     explicit CMutableTransaction();
     explicit CMutableTransaction(const CTransaction& tx);

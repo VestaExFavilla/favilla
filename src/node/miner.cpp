@@ -15,6 +15,8 @@
 #include <consensus/tx_verify.h>
 #include <consensus/validation.h>
 #include <deploymentstatus.h>
+#include <favilla/btcheaders.h>
+#include <favilla/favilla.h>
 #include <logging.h>
 #include <node/context.h>
 #include <node/kernel_notifications.h>
@@ -196,6 +198,22 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock()
     coinbaseTx.nLockTime = static_cast<uint32_t>(nHeight - 1);
     coinbase_tx.lock_time = coinbaseTx.nLockTime;
 
+    // Favilla D13a (SPEC §1.1): commit to the Bitcoin validation tip in the
+    // coinbase — one output with scriptPubKey 0x6a 0x20 || H (H = the 32-byte
+    // tip hash in internal byte order), value 0 — so it is covered by the
+    // coinbase -> Merkle root and miners cannot equivocate about which
+    // Bitcoin state they validated against. Miners SHOULD commit to their
+    // freshest tip; the zero hash ("no tip") is committed when the header
+    // chain is empty (valid only for blocks without claims).
+    if (chainparams.GetConsensus().fZeroSubsidy) {
+        CTxOut commitOut;
+        commitOut.nValue = 0;
+        const uint256 tipHash{::g_btcHeaderChain.GetTipHash()};
+        commitOut.scriptPubKey = CScript() << OP_RETURN
+                                           << std::vector<unsigned char>(tipHash.begin(), tipHash.end());
+        coinbaseTx.vout.push_back(commitOut);
+    }
+
     pblock->vtx[0] = MakeTransactionRef(std::move(coinbaseTx));
     m_chainstate.m_chainman.GenerateCoinbaseCommitment(*pblock, pindexPrev);
 
@@ -295,7 +313,17 @@ void BlockAssembler::addChunks()
 
     while (selected_transactions.size() > 0) {
         // Check to see if min fee rate is still respected.
-        if (chunk_feerate_vsize << m_options.blockMinFeeRate.GetFeePerVSize()) {
+        // Favilla SPEC §10: burn claims are feeless by consensus (the burn
+        // itself is the anti-spam); the min fee rate does not apply to a
+        // chunk consisting solely of a claim.
+        bool only_claims{true};
+        for (const auto& tx : selected_transactions) {
+            if (tx.get().GetTx().version != Favilla::TX_VERSION_CLAIM) {
+                only_claims = false;
+                break;
+            }
+        }
+        if (!only_claims && chunk_feerate_vsize << m_options.blockMinFeeRate.GetFeePerVSize()) {
             // Everything else we might consider has a lower feerate
             return;
         }

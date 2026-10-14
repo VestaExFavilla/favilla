@@ -73,6 +73,98 @@ static CBlock CreateGenesisBlock(uint32_t nTime, uint32_t nNonce, uint32_t nBits
 }
 
 /**
+ * Favilla regtest genesis block (SPEC §4). This deliberately replaces the
+ * upstream-identical regtest genesis that the S2 chainparams work kept
+ * byte-identical: the Favilla genesis carries the "ex favilla" message and
+ * creates zero spendable coins (value-0 OP_RETURN output — no premine).
+ *
+ * Reference test vector (SPEC §4):
+ *   coinbase txid : 6f524b7e3e09da828b482b3c85148e050c7753f1b053f2bd6e92ae4282efba60
+ *   merkle root   : 6f524b7e3e09da828b482b3c85148e050c7753f1b053f2bd6e92ae4282efba60
+ *   nonce         : 2
+ *   block hash    : 7cbe5b666f7c8702523033b0218dff488196c2818006ef3c216179ca0858e735
+ */
+static CBlock CreateFavillaGenesisBlock()
+{
+    CMutableTransaction txNew;
+    txNew.version = 1;
+    txNew.vin.resize(1);
+    txNew.vout.resize(1);
+    // BIP34 height 0 (OP_0), then a push of the 10-byte message "ex favilla".
+    static constexpr unsigned char msg[] = {'e', 'x', ' ', 'f', 'a', 'v', 'i', 'l', 'l', 'a'};
+    txNew.vin[0].prevout.SetNull();
+    txNew.vin[0].scriptSig = CScript() << OP_0 << std::vector<unsigned char>(std::begin(msg), std::end(msg));
+    txNew.vin[0].nSequence = CTxIn::SEQUENCE_FINAL;
+    // No premine: value 0 with an OP_RETURN output — zero spendable coins.
+    txNew.vout[0].nValue = 0;
+    txNew.vout[0].scriptPubKey = CScript() << OP_RETURN;
+    txNew.nLockTime = 0;
+
+    CBlock genesis;
+    genesis.nTime = 1791288000; // 2026-10-06 12:00:00 UTC
+    genesis.nBits = 0x207fffff;
+    genesis.nNonce = 2;
+    genesis.nVersion = 1;
+    genesis.vtx.push_back(MakeTransactionRef(std::move(txNew)));
+    genesis.hashPrevBlock.SetNull();
+    genesis.hashMerkleRoot = BlockMerkleRoot(genesis);
+    return genesis;
+}
+
+/**
+ * Favilla testnet genesis block (SPEC §4.1). Same recipe as the regtest
+ * genesis (CreateFavillaGenesisBlock): BIP34 height-0 coinbase carrying an
+ * ASCII message, value-0 OP_RETURN output (no premine). Only the message,
+ * timestamp, and resulting nonce/hash differ.
+ *
+ * D13 RESET 2026-10-11: the pre-D13 testnet chain (old §4.1 vector) cannot
+ * continue — its blocks lack the §1.1 Bitcoin-tip commitment. New genesis
+ * message "ex favilla testnet d13 2026-10-11".
+ *
+ * Reference test vector (computed 2026-10-11; the builder MUST reproduce it
+ * or document any deviation):
+ *   coinbase hex :
+ *   01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff230021657820666176696c6c6120746573746e65742064313320323032362d31302d3131ffffffff010000000000000000016a00000000
+ *   coinbase txid : 7e56bc74c84f41212486a1daf6a40f110e13eeab3a11aabd180adb7e482ee939
+ *   merkle root   : 7e56bc74c84f41212486a1daf6a40f110e13eeab3a11aabd180adb7e482ee939
+ *   nonce         : 64029800
+ *   header hex    :
+ *   01000000000000000000000000000000000000000000000000000000000000000000000039e92e487edb0a18bdaa113aabee130e110fa4f6daa1862421414fc874bc567e407acb6affff001e6804d103
+ *   block hash    : 0000000f26cb4006e674f19fe9d71edd7f981cfcd384460c3259275029e7e744
+ */
+static CBlock CreateFavillaTestNetGenesisBlock()
+{
+    CMutableTransaction txNew;
+    txNew.version = 1;
+    txNew.vin.resize(1);
+    txNew.vout.resize(1);
+    // BIP34 height 0 (OP_0), then a push of the 33-byte message
+    // "ex favilla testnet d13 2026-10-11".
+    static constexpr unsigned char msg[] = {'e','x',' ','f','a','v','i','l','l','a',' ',
+                                            't','e','s','t','n','e','t',' ',
+                                            'd','1','3',' ',
+                                            '2','0','2','6','-','1','0','-','1','1'};
+    static_assert(sizeof(msg) == 33);
+    txNew.vin[0].prevout.SetNull();
+    txNew.vin[0].scriptSig = CScript() << OP_0 << std::vector<unsigned char>(std::begin(msg), std::end(msg));
+    txNew.vin[0].nSequence = CTxIn::SEQUENCE_FINAL;
+    // No premine: value 0 with an OP_RETURN output — zero spendable coins.
+    txNew.vout[0].nValue = 0;
+    txNew.vout[0].scriptPubKey = CScript() << OP_RETURN;
+    txNew.nLockTime = 0;
+
+    CBlock genesis;
+    genesis.nTime = 1791720000; // 2026-10-11 12:00:00 UTC
+    genesis.nBits = 0x1e00ffff;
+    genesis.nNonce = 64029800;
+    genesis.nVersion = 1;
+    genesis.vtx.push_back(MakeTransactionRef(std::move(txNew)));
+    genesis.hashPrevBlock.SetNull();
+    genesis.hashMerkleRoot = BlockMerkleRoot(genesis);
+    return genesis;
+}
+
+/**
  * Main network on which people trade goods and services.
  */
 class CMainParams : public CChainParams {
@@ -206,30 +298,40 @@ public:
 };
 
 /**
- * Testnet (v3): public test network which is reset from time to time.
+ * Favilla public testnet. Reuses the ChainType::TESTNET slot (selected via
+ * -chain=testnet or -testnet); the old Bitcoin-testnet3 parameters this
+ * class used to carry are gone — this is a Favilla chain now, with the same
+ * consensus rules as the regtest prototype (SPEC §1: eras, Vigil,
+ * signature-gated claims, zero subsidy). Only chain identity differs.
  */
-class CTestNetParams : public CChainParams {
+class CFavillaTestNetParams : public CChainParams {
 public:
-    CTestNetParams() {
+    CFavillaTestNetParams() {
         m_chain_type = ChainType::TESTNET;
         consensus.signet_blocks = false;
         consensus.signet_challenge.clear();
         consensus.nSubsidyHalvingInterval = 210000;
-        consensus.script_flag_exceptions.emplace( // BIP16 exception
-            uint256{"00000000dd30457c001f4095d208cc1296b0eed002427aa599874af7a432b105"}, SCRIPT_VERIFY_NONE);
-        consensus.BIP34Height = 21111;
-        consensus.BIP34Hash = uint256{"0000000023b3a96d3484e5abb3755c413e7d41500f8e2a5c3f0dd01299cd8ef8"};
-        consensus.BIP65Height = 581885; // 00000000007f6655f22f98e72ed80d8b06dc761d5da09df0fa1dc4be4f861eb6
-        consensus.BIP66Height = 330776; // 000000002104c8c45e99a8853285a3b592602a3ccde2b832481da85e9e4ba182
-        consensus.CSVHeight = 770112; // 00000000025e930139bac5c6c31a403776da130831ab85be56578f3fa75369bb
-        consensus.SegwitHeight = 834624; // 00000000002b980fcd729daaa248fd9316a5200e9b367f4ff2c42453e84201ca
-        consensus.MinBIP9WarningHeight = 836640; // segwit activation height + miner confirmation window
-        consensus.powLimit = uint256{"00000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffff"};
+        consensus.BIP34Height = 1;
+        consensus.BIP34Hash = uint256{};
+        consensus.BIP65Height = 1;
+        consensus.BIP66Height = 1;
+        consensus.CSVHeight = 1;
+        consensus.SegwitHeight = 0;
+        consensus.MinBIP9WarningHeight = 0;
+        // powLimit = target(0x1e00ffff): minimum difficulty, CPU-mineable.
+        // (NOT 0x207fffff: powLimit must satisfy powLimit*4*nPowTargetTimespan
+        // < 2^256 or CalculateNextWorkRequired's target*timespan multiplication
+        // overflows — see the ChainParams sanity test in pow_tests.cpp.)
+        consensus.powLimit = uint256{"000000ffff000000000000000000000000000000000000000000000000000000"};
         consensus.nPowTargetTimespan = 14 * 24 * 60 * 60; // two weeks
-        consensus.nPowTargetSpacing = 10 * 60;
-        consensus.fPowAllowMinDifficultyBlocks = true;
+        consensus.nPowTargetSpacing = 10 * 60;            // 600 s (SPEC §1)
+        consensus.fPowAllowMinDifficultyBlocks = true;    // keep the chain alive with sparse miners
         consensus.enforce_BIP94 = false;
-        consensus.fPowNoRetargeting = false;
+        consensus.fPowNoRetargeting = false;              // real 2016-block retarget (SPEC §1)
+
+        // Favilla: block subsidy is identically zero; issuance happens only
+        // through burn claims (SPEC §1). The coinbase must equal total fees.
+        consensus.fZeroSubsidy = true;
         consensus.vDeployments[Consensus::DEPLOYMENT_TESTDUMMY].bit = 28;
         consensus.vDeployments[Consensus::DEPLOYMENT_TESTDUMMY].nStartTime = Consensus::BIP9Deployment::NEVER_ACTIVE;
         consensus.vDeployments[Consensus::DEPLOYMENT_TESTDUMMY].nTimeout = Consensus::BIP9Deployment::NO_TIMEOUT;
@@ -237,76 +339,69 @@ public:
         consensus.vDeployments[Consensus::DEPLOYMENT_TESTDUMMY].threshold = 1512; // 75%
         consensus.vDeployments[Consensus::DEPLOYMENT_TESTDUMMY].period = 2016;
 
-        // Deployment of Taproot (BIPs 340-342)
+        // Deployment of Taproot (BIPs 340-342): always active, like regtest —
+        // all soft-fork script rules are live from height 0 (SPEC §1).
         consensus.vDeployments[Consensus::DEPLOYMENT_TAPROOT].bit = 2;
-        consensus.vDeployments[Consensus::DEPLOYMENT_TAPROOT].nStartTime = 1619222400; // April 24th, 2021
-        consensus.vDeployments[Consensus::DEPLOYMENT_TAPROOT].nTimeout = 1628640000; // August 11th, 2021
+        consensus.vDeployments[Consensus::DEPLOYMENT_TAPROOT].nStartTime = Consensus::BIP9Deployment::ALWAYS_ACTIVE;
+        consensus.vDeployments[Consensus::DEPLOYMENT_TAPROOT].nTimeout = Consensus::BIP9Deployment::NO_TIMEOUT;
         consensus.vDeployments[Consensus::DEPLOYMENT_TAPROOT].min_activation_height = 0; // No activation delay
         consensus.vDeployments[Consensus::DEPLOYMENT_TAPROOT].threshold = 1512; // 75%
         consensus.vDeployments[Consensus::DEPLOYMENT_TAPROOT].period = 2016;
 
-        consensus.nMinimumChainWork = uint256{"0000000000000000000000000000000000000000000017dde1c649f3708d14b6"};
-        consensus.defaultAssumeValid = uint256{"000000007a61e4230b28ac5cb6b5e5a0130de37ac1faf2f8987d2fa6505b67f4"}; // 4842348
+        consensus.nMinimumChainWork = uint256{};
+        consensus.defaultAssumeValid = uint256{};
 
-        pchMessageStart[0] = 0x0b;
-        pchMessageStart[1] = 0x11;
-        pchMessageStart[2] = 0x09;
-        pchMessageStart[3] = 0x07;
-        nDefaultPort = 18333;
+        // Favilla testnet network magic: ASCII "fvlt" (0x66 0x76 0x6c 0x74).
+        // D10 collision analysis is documented in SPEC §2; it differs from
+        // every known network magic checked there.
+        pchMessageStart[0] = 0x66;
+        pchMessageStart[1] = 0x76;
+        pchMessageStart[2] = 0x6c;
+        pchMessageStart[3] = 0x74;
+        nDefaultPort = 34444;
         nPruneAfterHeight = 1000;
-        m_assumed_blockchain_size = 245;
-        m_assumed_chain_state_size = 19;
+        m_assumed_blockchain_size = 0;
+        m_assumed_chain_state_size = 0;
 
-        genesis = CreateGenesisBlock(1296688602, 414098458, 0x1d00ffff, 1, 50 * COIN);
+        // Favilla testnet genesis (SPEC §2/§4): "ex favilla testnet" message,
+        // value-0 OP_RETURN coinbase — no premine, same recipe as regtest.
+        genesis = CreateFavillaTestNetGenesisBlock();
         consensus.hashGenesisBlock = genesis.GetHash();
-        assert(consensus.hashGenesisBlock == uint256{"000000000933ea01ad0ee984209779baaec3ced90fa3f408719526f8d77f4943"});
-        assert(genesis.hashMerkleRoot == uint256{"4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b"});
+        assert(consensus.hashGenesisBlock == uint256{"0000000f26cb4006e674f19fe9d71edd7f981cfcd384460c3259275029e7e744"});
+        assert(genesis.hashMerkleRoot == uint256{"7e56bc74c84f41212486a1daf6a40f110e13eeab3a11aabd180adb7e482ee939"});
 
-        vFixedSeeds.clear();
-        vSeeds.clear();
-        // nodes with support for servicebits filtering should be at the top
-        vSeeds.emplace_back("testnet-seed.bitcoin.jonasschnelli.ch.");
-        vSeeds.emplace_back("seed.tbtc.petertodd.net.");
-        vSeeds.emplace_back("seed.testnet.bitcoin.sprovoost.nl.");
-        vSeeds.emplace_back("testnet-seed.bluematt.me."); // Just a static list of stable node(s), only supports x9
-        vSeeds.emplace_back("seed.testnet.achownodes.xyz."); // Ava Chow, only supports x1, x5, x9, x49, x809, x849, xd, x400, x404, x408, x448, xc08, xc48, x40c
+        vFixedSeeds.clear(); //!< No fixed seeds yet; Phase 2 wires up the seed node.
+        vSeeds.clear();      //!< No DNS seeds yet.
 
-        base58Prefixes[PUBKEY_ADDRESS] = std::vector<unsigned char>(1,111);
-        base58Prefixes[SCRIPT_ADDRESS] = std::vector<unsigned char>(1,196);
-        base58Prefixes[SECRET_KEY] =     std::vector<unsigned char>(1,239);
-        base58Prefixes[EXT_PUBLIC_KEY] = {0x04, 0x35, 0x87, 0xCF};
-        base58Prefixes[EXT_SECRET_KEY] = {0x04, 0x35, 0x83, 0x94};
+        // Favilla testnet address prefixes (deliberately distinct from the
+        // regtest values 35/95/96 and from Bitcoin's 0/5/128 and 111/196/239
+        // families — see SPEC §2):
+        //  - P2PKH  prefix 36 (0x24)
+        //  - P2SH   prefix 97 (0x61)
+        //  - WIF    prefix 98 (0x62)
+        //  - xpub-equivalent {0x46,0x4c,0x9e,0x77} ("Fvat..." — FVa testnet public)
+        //  - xprv-equivalent {0x46,0x4c,0xa1,0xa1} ("Fvau..." — FVa testnet private)
+        base58Prefixes[PUBKEY_ADDRESS] = std::vector<unsigned char>(1,36);
+        base58Prefixes[SCRIPT_ADDRESS] = std::vector<unsigned char>(1,97);
+        base58Prefixes[SECRET_KEY] =     std::vector<unsigned char>(1,98);
+        base58Prefixes[EXT_PUBLIC_KEY] = {0x46, 0x4c, 0x9e, 0x77};
+        base58Prefixes[EXT_SECRET_KEY] = {0x46, 0x4c, 0xa1, 0xa1};
 
-        bech32_hrp = "tb";
-
-        vFixedSeeds = std::vector<uint8_t>(std::begin(chainparams_seed_test), std::end(chainparams_seed_test));
+        bech32_hrp = "fvlt"; // mainnet HRP "fvla" stays RESERVED
 
         fDefaultConsistencyChecks = false;
         m_is_mockable_chain = false;
 
-        m_assumeutxo_data = {
-            {
-                .height = 2'500'000,
-                .hash_serialized = AssumeutxoHash{uint256{"f841584909f68e47897952345234e37fcd9128cd818f41ee6c3ca68db8071be7"}},
-                .m_chain_tx_count = 66484552,
-                .blockhash = uint256{"0000000000000093bcb68c03a9a168ae252572d348a2eaeba2cdf9231d73206f"},
-            },
-            {
-                .height = 4'840'000,
-                .hash_serialized = AssumeutxoHash{uint256{"ce6bb677bb2ee9789c4a1c9d73e6683c53fc20e8fdbedbdaaf468982a0c8db2a"}},
-                .m_chain_tx_count = 536078574,
-                .blockhash = uint256{"00000000000000f4971a7fb37fbdff89315b69a2e1920c467654a382f0d64786"},
-            }
-        };
+        m_assumeutxo_data = {}; // no snapshots for the new testnet
 
         chainTxData = ChainTxData{
-            // Data from RPC: getchaintxstats 4096 000000007a61e4230b28ac5cb6b5e5a0130de37ac1faf2f8987d2fa6505b67f4
-            .nTime    = 1772051651,
-            .tx_count = 536108416,
-            .dTxRate  = 0.02691479016257117,
+            .nTime    = 0,
+            .tx_count = 0,
+            .dTxRate  = 0,
         };
 
-        // Generated by headerssync-params.py on 2026-02-25.
+        // Placeholder headers-sync parameters (copied from upstream testnet
+        // defaults; a fresh run of headerssync-params.py can tune these later).
         m_headers_sync_params = HeadersSyncParams{
             .commitment_period = 673,
             .redownload_buffer_size = 14460, // 14460/673 = ~21.5 commitments
@@ -579,6 +674,10 @@ public:
         consensus.enforce_BIP94 = opts.enforce_bip94;
         consensus.fPowNoRetargeting = true;
 
+        // Favilla: block subsidy is identically zero; issuance happens only
+        // through burn claims (SPEC §1). The coinbase must equal total fees.
+        consensus.fZeroSubsidy = true;
+
         consensus.vDeployments[Consensus::DEPLOYMENT_TESTDUMMY].bit = 28;
         consensus.vDeployments[Consensus::DEPLOYMENT_TESTDUMMY].nStartTime = 0;
         consensus.vDeployments[Consensus::DEPLOYMENT_TESTDUMMY].nTimeout = Consensus::BIP9Deployment::NO_TIMEOUT;
@@ -596,11 +695,14 @@ public:
         consensus.nMinimumChainWork = uint256{};
         consensus.defaultAssumeValid = uint256{};
 
-        pchMessageStart[0] = 0xfa;
-        pchMessageStart[1] = 0xbf;
-        pchMessageStart[2] = 0xb5;
-        pchMessageStart[3] = 0xda;
-        nDefaultPort = 18444;
+        // Favilla regtest network magic: ASCII "fvla" (0x66 0x76 0x6c 0x61).
+        // Chosen to be distinct from Bitcoin mainnet (f9 be b4 d9), testnet3
+        // (0b 11 09 07), Bitcoin regtest (fa bf b5 da), and signet (1c 16 3f 28).
+        pchMessageStart[0] = 0x66;
+        pchMessageStart[1] = 0x76;
+        pchMessageStart[2] = 0x6c;
+        pchMessageStart[3] = 0x61;
+        nDefaultPort = 28444;
         nPruneAfterHeight = opts.fastprune ? 100 : 1000;
         m_assumed_blockchain_size = 0;
         m_assumed_chain_state_size = 0;
@@ -631,10 +733,14 @@ public:
             consensus.vDeployments[deployment_pos].min_activation_height = version_bits_params.min_activation_height;
         }
 
-        genesis = CreateGenesisBlock(1296688602, 2, 0x207fffff, 1, 50 * COIN);
+        // Favilla regtest genesis (SPEC §4): replaces the upstream-identical
+        // regtest genesis. Any pre-existing regtest datadirs are invalidated
+        // by this change and must be wiped.
+        genesis = CreateFavillaGenesisBlock();
         consensus.hashGenesisBlock = genesis.GetHash();
-        assert(consensus.hashGenesisBlock == uint256{"0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206"});
-        assert(genesis.hashMerkleRoot == uint256{"4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b"});
+        // SPEC §4 reference test vector — the builder must reproduce it exactly.
+        assert(consensus.hashGenesisBlock == uint256{"7cbe5b666f7c8702523033b0218dff488196c2818006ef3c216179ca0858e735"});
+        assert(genesis.hashMerkleRoot == uint256{"6f524b7e3e09da828b482b3c85148e050c7753f1b053f2bd6e92ae4282efba60"});
 
         vFixedSeeds.clear(); //!< Regtest mode doesn't have any fixed seeds.
         vSeeds.clear();
@@ -672,13 +778,20 @@ public:
             .dTxRate = 0.001, // Set a non-zero rate to make it testable
         };
 
-        base58Prefixes[PUBKEY_ADDRESS] = std::vector<unsigned char>(1,111);
-        base58Prefixes[SCRIPT_ADDRESS] = std::vector<unsigned char>(1,196);
-        base58Prefixes[SECRET_KEY] =     std::vector<unsigned char>(1,239);
-        base58Prefixes[EXT_PUBLIC_KEY] = {0x04, 0x35, 0x87, 0xCF};
-        base58Prefixes[EXT_SECRET_KEY] = {0x04, 0x35, 0x83, 0x94};
+        // Favilla regtest address prefixes (deliberately distinct from Bitcoin's
+        // 0/5/128 mainnet and 111/196/239 test families, and from common altcoins):
+        //  - P2PKH  prefix 35 (0x23)  -> addresses start with 'F'
+        //  - P2SH   prefix 95 (0x5f)  -> addresses start with 'f'
+        //  - WIF    prefix 96 (0x60)  -> private keys start with 'F'
+        //  - xpub-equivalent {0x46,0x4c,0x9d,0x76} -> "Fvap..." ("FVa public")
+        //  - xprv-equivalent {0x46,0x4c,0xa0,0xa0} -> "Fvar..." ("FVa private")
+        base58Prefixes[PUBKEY_ADDRESS] = std::vector<unsigned char>(1,35);
+        base58Prefixes[SCRIPT_ADDRESS] = std::vector<unsigned char>(1,95);
+        base58Prefixes[SECRET_KEY] =     std::vector<unsigned char>(1,96);
+        base58Prefixes[EXT_PUBLIC_KEY] = {0x46, 0x4c, 0x9d, 0x76};
+        base58Prefixes[EXT_SECRET_KEY] = {0x46, 0x4c, 0xa0, 0xa0};
 
-        bech32_hrp = "bcrt";
+        bech32_hrp = "fvla";
 
         // Copied from Testnet4.
         m_headers_sync_params = HeadersSyncParams{
@@ -705,7 +818,7 @@ std::unique_ptr<const CChainParams> CChainParams::Main()
 
 std::unique_ptr<const CChainParams> CChainParams::TestNet()
 {
-    return std::make_unique<const CTestNetParams>();
+    return std::make_unique<const CFavillaTestNetParams>();
 }
 
 std::unique_ptr<const CChainParams> CChainParams::TestNet4()

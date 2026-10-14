@@ -18,6 +18,9 @@
 #include <consensus/tx_verify.h>
 #include <consensus/validation.h>
 #include <cuckoocache.h>
+#include <favilla/btcheaders.h>
+#include <favilla/claim.h>
+#include <favilla/favilla.h>
 #include <flatfile.h>
 #include <hash.h>
 #include <kernel/chainparams.h>
@@ -695,6 +698,11 @@ private:
     // Try to add the transaction to the mempool, removing any conflicts first.
     void FinalizeSubpackage(const ATMPArgs& args) EXCLUSIVE_LOCKS_REQUIRED(cs_main, m_pool.cs);
 
+    // Favilla: dedicated mempool path for version-4 burn claims (SPEC §10).
+    // Claims are inputless and feeless by consensus, so the input/script/fee
+    // machinery in PreChecks does not apply to them.
+    MempoolAcceptResult AcceptClaimTransaction(const CTransactionRef& ptx, ATMPArgs& args) EXCLUSIVE_LOCKS_REQUIRED(cs_main, m_pool.cs);
+
     // Submit all transactions to the mempool and call ConsensusScriptChecks to add to the script
     // cache - should only be called after successful validation of all transactions in the package.
     // Does not call LimitMempoolSize(), so mempool max_size_bytes may be temporarily exceeded.
@@ -1318,10 +1326,99 @@ bool MemPoolAccept::SubmitPackage(const ATMPArgs& args, std::vector<Workspace>& 
     return all_submitted;
 }
 
+MempoolAcceptResult MemPoolAccept::AcceptClaimTransaction(const CTransactionRef& ptx, ATMPArgs& args)
+{
+    AssertLockHeld(cs_main);
+    AssertLockHeld(m_pool.cs);
+    const CTransaction& tx = *ptx;
+    const std::vector<Wtxid> single_wtxid{tx.GetWitnessHash()};
+    TxValidationState state;
+
+    // 1. Structural checks (M1/M2/M3 — malformed vs consensus).
+    if (!CheckTransaction(tx, state)) {
+        return MempoolAcceptResult::Failure(state);
+    }
+
+    // 2. Exact transaction already in the mempool.
+    if (m_pool.exists(tx.GetWitnessHash())) {
+        state.Invalid(TxValidationResult::TX_CONFLICT, "txn-already-in-mempool");
+        return MempoolAcceptResult::Failure(state);
+    }
+
+    // 3. SPEC §10 policy: at most one mempool claim per burn txid.
+    if (m_pool.HasClaimForBurn(tx.claim_burn_txid)) {
+        state.Invalid(TxValidationResult::TX_CONFLICT, "claim-burn-already-in-mempool",
+                      "another claim for this burn txid is already in the mempool");
+        return MempoolAcceptResult::Failure(state);
+    }
+
+    // 4. Contextual validity (V1-V7) at the assumed next height. Do NOT admit
+    // claims that are currently invalid (e.g. depth < 144); wallets resubmit
+    // when the burn matures. SPEC §10: for the V3 depth pre-check, assume the
+    // block's commitment will be the node's current active Bitcoin tip
+    // (miners SHOULD commit to their freshest tip; final validity is judged
+    // against the block's actual commitment at block-validation time).
+    {
+        CCoinsViewCache view(&m_active_chainstate.CoinsTip());
+        const std::set<uint256> blockNullifiers;
+        const int nHeight{m_active_chainstate.m_chain.Height() + 1};
+        const uint256 committedTip{::g_btcHeaderChain.GetTipHash()};
+        if (Favilla::CheckClaimContextual(tx, nHeight, /*nTxIndex=*/0, state, view,
+                                          blockNullifiers, committedTip) != Favilla::ClaimCheckResult::VALID) {
+            return MempoolAcceptResult::Failure(state);
+        }
+    }
+
+    // 5. Feeless by consensus (SPEC §10): no minimum-fee policy applies.
+    // Stage the addition directly, bypassing the input/script/fee machinery.
+    if (!m_subpackage.m_changeset) {
+        m_subpackage.m_changeset = m_pool.GetChangeSet();
+    }
+    const uint64_t entry_sequence{m_pool.GetSequence()};
+    // Claims are always final (nLockTime == 0, marker nSequence == FINAL).
+    const LockPoints lp{};
+    auto tx_handle{m_subpackage.m_changeset->StageAddition(ptx, /*fee=*/0, args.m_accept_time,
+        m_active_chainstate.m_chain.Height(), entry_sequence, /*spends_coinbase=*/false,
+        /*sigops_cost=*/GetLegacySigOpCount(tx), lp)};
+    const int64_t vsize{tx_handle->GetTxSize()};
+
+    if (!m_subpackage.m_changeset->CheckMemPoolPolicyLimits()) {
+        state.Invalid(TxValidationResult::TX_MEMPOOL_POLICY, "too-large-cluster", "");
+        return MempoolAcceptResult::Failure(state);
+    }
+
+    const CFeeRate effective_feerate{0, static_cast<int32_t>(vsize)};
+    if (args.m_test_accept) {
+        return MempoolAcceptResult::Success(/*replaced=*/{}, vsize, /*base_fees=*/0,
+                                            effective_feerate, single_wtxid);
+    }
+
+    FinalizeSubpackage(args);
+
+    // Trim the mempool if needed. Zero-fee claims are the first to go under
+    // pressure — the §10 anti-spam posture (bounded claim allocation, no fee
+    // to compare).
+    if (!args.m_package_submission && !args.m_bypass_limits) {
+        LimitMempoolSize(m_pool, m_active_chainstate.CoinsTip());
+        if (!m_pool.exists(tx.GetHash())) {
+            state.Invalid(TxValidationResult::TX_RECONSIDERABLE, "mempool full");
+            return MempoolAcceptResult::FeeFailure(state, effective_feerate, single_wtxid);
+        }
+    }
+
+    return MempoolAcceptResult::Success(/*replaced=*/{}, vsize, /*base_fees=*/0,
+                                        effective_feerate, single_wtxid);
+}
+
 MempoolAcceptResult MemPoolAccept::AcceptSingleTransactionInternal(const CTransactionRef& ptx, ATMPArgs& args)
 {
     AssertLockHeld(cs_main);
     AssertLockHeld(m_pool.cs);
+
+    // Favilla: version-4 burn claims take a dedicated, simplified mempool path.
+    if (ptx->version == Favilla::TX_VERSION_CLAIM) {
+        return AcceptClaimTransaction(ptx, args);
+    }
 
     Workspace ws(ptx);
     const std::vector<Wtxid> single_wtxid{ws.m_ptx->GetWitnessHash()};
@@ -1842,6 +1939,11 @@ PackageMempoolAcceptResult ProcessNewPackage(Chainstate& active_chainstate, CTxM
 
 CAmount GetBlockSubsidy(int nHeight, const Consensus::Params& consensusParams)
 {
+    // Favilla: block subsidy is identically zero for all heights (SPEC §1).
+    // Issuance happens only through burn claims.
+    if (consensusParams.fZeroSubsidy) {
+        return 0;
+    }
     int halvings = nHeight / consensusParams.nSubsidyHalvingInterval;
     // Force block reward to zero when right shift is undefined.
     if (halvings >= 64)
@@ -2003,7 +2105,8 @@ void Chainstate::InvalidBlockFound(CBlockIndex* pindex, const BlockValidationSta
 void UpdateCoins(const CTransaction& tx, CCoinsViewCache& inputs, CTxUndo &txundo, int nHeight)
 {
     // mark inputs spent
-    if (!tx.IsCoinBase()) {
+    // Favilla: claims carry only the marker input, which spends no UTXO.
+    if (!tx.IsCoinBase() && !tx.IsClaim()) {
         txundo.vprevout.reserve(tx.vin.size());
         for (const CTxIn &txin : tx.vin) {
             txundo.vprevout.emplace_back();
@@ -2228,7 +2331,8 @@ DisconnectResult Chainstate::DisconnectBlock(const CBlock& block, const CBlockIn
         }
 
         // restore inputs
-        if (i > 0) { // not coinbases
+        // Favilla: claims spend no inputs (marker input only); nothing to restore.
+        if (i > 0 && !tx.IsClaim()) { // not coinbases
             CTxUndo &txundo = blockUndo.vtxundo[i-1];
             if (txundo.vprevout.size() != tx.vin.size()) {
                 LogError("DisconnectBlock(): transaction and undo data inconsistent\n");
@@ -2242,6 +2346,21 @@ DisconnectResult Chainstate::DisconnectBlock(const CBlock& block, const CBlockIn
                 fClean = fClean && res != DISCONNECT_UNCLEAN;
             }
             // At this point, all of txundo.vprevout should have been moved out.
+        }
+    }
+
+    // Favilla: delete this block's nullifier keys (SPEC §8, §13.1). The burns
+    // become claimable again; the §8 invariant (nullifier set == burn txids
+    // claimed by version-4 txs in the active chain) is preserved.
+    for (const uint256& burn_txid : blockUndo.vNullifierKeys) {
+        view.EraseNullifier(burn_txid);
+    }
+
+    // Favilla: delete this block's Vigil-MTP records (SPEC §11.1, D13d).
+    // The mint outpoint of a claim is exactly (claim txid, vout 0).
+    for (const auto& tx : block.vtx) {
+        if (tx->IsClaim()) {
+            view.EraseVigilMtp(COutPoint(tx->GetHash(), 0));
         }
     }
 
@@ -2524,6 +2643,19 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
     int nInputs = 0;
     int64_t nSigOpsCost = 0;
     blockundo.vtxundo.reserve(block.vtx.size() - 1);
+    // Favilla: burn txids claimed by this block (SPEC §7.4: processed in
+    // order; a second claim for the same burn_txid fails V1). Inserted into
+    // the nullifier set after all transactions validate (SPEC §8).
+    std::set<uint256> blockNullifiers;
+    // Favilla D13b/D13d: the block's committed Bitcoin tip (SPEC §1.1, D13a).
+    // ContextualCheckBlock already enforced exactly one commitment output at
+    // height >= 1; fail closed here if it is somehow absent (claims then see
+    // the zero hash and are INVALID).
+    uint256 committedTip;
+    if (pindex->nHeight >= 1) {
+        const Favilla::BlockCommitment bc{Favilla::GetBlockCommitment(block)};
+        if (bc.count == 1) committedTip = bc.tip;
+    }
     for (unsigned int i = 0; i < block.vtx.size(); i++)
     {
         if (!state.IsValid()) break;
@@ -2531,50 +2663,140 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
 
         nInputs += tx.vin.size();
 
-        if (!tx.IsCoinBase())
+        if (tx.IsClaim())
         {
-            CAmount txfee = 0;
+            // Favilla burn claim (SPEC §7): contextual validation V1-V7.
+            // Claims are feeless and inputless by consensus: no CheckTxInputs,
+            // no fee tally, no BIP68 sequence locks, and no script checks on
+            // the (never executed) marker input.
             TxValidationState tx_state;
-            if (!Consensus::CheckTxInputs(tx, tx_state, view, pindex->nHeight, txfee)) {
+            const Favilla::ClaimCheckResult claimRes{
+                Favilla::CheckClaimContextual(tx, pindex->nHeight, i, tx_state, view,
+                                              blockNullifiers, committedTip)};
+            if (claimRes == Favilla::ClaimCheckResult::HELD) {
+                // D13b: the block's committed Bitcoin tip is unknown to this
+                // node. The block is HELD as not-yet-validated: stored but
+                // left unconnected, NEVER marked invalid, no peer penalty.
+                // state.Error (not Invalid) gives exactly that: ConnectTip
+                // skips InvalidBlockFound and chain activation aborts as a
+                // non-consensus failure; the header-feeding RPCs re-trigger
+                // activation as headers arrive.
+                Favilla::SetHeldBlocks();
+                state.Error("bad-block-bitcoin-tip-unknown: committed Bitcoin tip unknown to "
+                            "this node; block held as not-yet-validated (D13b), re-validates "
+                            "as headers arrive");
+                break;
+            }
+            if (claimRes != Favilla::ClaimCheckResult::VALID) {
                 // Any transaction validation failure in ConnectBlock is a block consensus failure
                 state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
                               tx_state.GetRejectReason(),
                               tx_state.GetDebugMessage() + " in transaction " + tx.GetHash().ToString());
                 break;
             }
-            nFees += txfee;
-            if (!MoneyRange(nFees)) {
-                state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-txns-accumulated-fee-outofrange",
-                              "accumulated fee in the block out of range");
+            blockNullifiers.insert(tx.claim_burn_txid);
+            // Count the claim's legacy sigops toward the block budget
+            // (GetTransactionSigOpCost would look up the null marker prevout).
+            nSigOpsCost += GetLegacySigOpCount(tx);
+            if (nSigOpsCost > MAX_BLOCK_SIGOPS_COST) {
+                state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-blk-sigops", "too many sigops");
                 break;
             }
+        }
+        else
+        {
+            if (!tx.IsCoinBase())
+            {
+                // Favilla D13d (SPEC §11.1): a transaction spending a
+                // Vigil-locked mint output is INVALID unless the spending
+                // block's committed Bitcoin tip has median-time-past >=
+                // burn_mtp + 126_000_000 s, where burn_mtp was recorded at
+                // claim time. Both locks must hold: this Bitcoin-time rule
+                // AND the CLTV script (checked later by the script engine).
+                for (const CTxIn& txin : tx.vin) {
+                    const Coin& coin{view.AccessCoin(txin.prevout)};
+                    if (coin.IsSpent() || !Favilla::IsVigilScript(coin.out.scriptPubKey)) {
+                        continue;
+                    }
+                    const std::optional<uint32_t> burn_mtp{view.GetVigilMtp(txin.prevout)};
+                    if (!burn_mtp.has_value()) {
+                        state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-vigil-mtp-missing",
+                                      "Vigil-locked output has no recorded burn Bitcoin MTP");
+                        break;
+                    }
+                    if (committedTip.IsNull()) {
+                        // A spending block committing the zero hash can never
+                        // satisfy the Bitcoin-time rule (SPEC §11.1).
+                        state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-vigil-zero-commitment",
+                                      "Vigil spend in a block with no Bitcoin commitment (D13d)");
+                        break;
+                    }
+                    if (!::g_btcHeaderChain.HaveHeader(committedTip)) {
+                        // As with claims (D13b): held, not invalid.
+                        Favilla::SetHeldBlocks();
+                        state.Error("bad-block-bitcoin-tip-unknown: committed Bitcoin tip unknown to "
+                                    "this node; block held as not-yet-validated (D13b), re-validates "
+                                    "as headers arrive");
+                        break;
+                    }
+                    const std::optional<uint32_t> tip_mtp{
+                        ::g_btcHeaderChain.GetMedianTimePast(committedTip)};
+                    if (!tip_mtp.has_value()) {
+                        state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-vigil-tip-mtp",
+                                      "committed Bitcoin tip has no computable median-time-past");
+                        break;
+                    }
+                    if (static_cast<uint64_t>(*tip_mtp) <
+                        static_cast<uint64_t>(*burn_mtp) + Favilla::VIGIL_BTC_SECONDS) {
+                        state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-vigil-bitcoin-time",
+                                      "Vigil spend before burn_mtp + 126000000s in Bitcoin time (D13d)");
+                        break;
+                    }
+                }
+                if (!state.IsValid()) break;
+                CAmount txfee = 0;
+                TxValidationState tx_state;
+                if (!Consensus::CheckTxInputs(tx, tx_state, view, pindex->nHeight, txfee)) {
+                    // Any transaction validation failure in ConnectBlock is a block consensus failure
+                    state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
+                                  tx_state.GetRejectReason(),
+                                  tx_state.GetDebugMessage() + " in transaction " + tx.GetHash().ToString());
+                    break;
+                }
+                nFees += txfee;
+                if (!MoneyRange(nFees)) {
+                    state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-txns-accumulated-fee-outofrange",
+                                  "accumulated fee in the block out of range");
+                    break;
+                }
 
-            // Check that transaction is BIP68 final
-            // BIP68 lock checks (as opposed to nLockTime checks) must
-            // be in ConnectBlock because they require the UTXO set
-            prevheights.resize(tx.vin.size());
-            for (size_t j = 0; j < tx.vin.size(); j++) {
-                prevheights[j] = view.AccessCoin(tx.vin[j].prevout).nHeight;
+                // Check that transaction is BIP68 final
+                // BIP68 lock checks (as opposed to nLockTime checks) must
+                // be in ConnectBlock because they require the UTXO set
+                prevheights.resize(tx.vin.size());
+                for (size_t j = 0; j < tx.vin.size(); j++) {
+                    prevheights[j] = view.AccessCoin(tx.vin[j].prevout).nHeight;
+                }
+
+                if (!SequenceLocks(tx, nLockTimeFlags, prevheights, *pindex)) {
+                    state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-txns-nonfinal",
+                                  "contains a non-BIP68-final transaction " + tx.GetHash().ToString());
+                    break;
+                }
             }
 
-            if (!SequenceLocks(tx, nLockTimeFlags, prevheights, *pindex)) {
-                state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-txns-nonfinal",
-                              "contains a non-BIP68-final transaction " + tx.GetHash().ToString());
+            // GetTransactionSigOpCost counts 3 types of sigops:
+            // * legacy (always)
+            // * p2sh (when P2SH enabled in flags and excludes coinbase)
+            // * witness (when witness enabled in flags and excludes coinbase)
+            nSigOpsCost += GetTransactionSigOpCost(tx, view, flags);
+            if (nSigOpsCost > MAX_BLOCK_SIGOPS_COST) {
+                state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-blk-sigops", "too many sigops");
                 break;
             }
         }
 
-        // GetTransactionSigOpCost counts 3 types of sigops:
-        // * legacy (always)
-        // * p2sh (when P2SH enabled in flags and excludes coinbase)
-        // * witness (when witness enabled in flags and excludes coinbase)
-        nSigOpsCost += GetTransactionSigOpCost(tx, view, flags);
-        if (nSigOpsCost > MAX_BLOCK_SIGOPS_COST) {
-            state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-blk-sigops", "too many sigops");
-            break;
-        }
-
-        if (!tx.IsCoinBase() && fScriptChecks)
+        if (!tx.IsCoinBase() && !tx.IsClaim() && fScriptChecks)
         {
             bool fCacheResults = fJustCheck; /* Don't cache results if we're actually connecting blocks (still consult the cache, though) */
             bool tx_ok;
@@ -2610,8 +2832,54 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
              Ticks<SecondsDouble>(m_chainman.time_connect),
              Ticks<MillisecondsDouble>(m_chainman.time_connect) / m_chainman.num_blocks_total);
 
+    // Favilla: insert the block's new nullifiers (SPEC §8). All of the block's
+    // transactions validated above; the nullifiers go into the same view (and
+    // hence the same database batch) as the UTXO updates, and into the undo
+    // data for reorg rollback. Only reached if the block is valid — a failed
+    // block must not leave nullifiers behind.
+    if (state.IsValid()) {
+        for (unsigned int i = 0; i < block.vtx.size(); i++) {
+            const CTransaction& tx = *(block.vtx[i]);
+            if (tx.IsClaim() && blockNullifiers.count(tx.claim_burn_txid)) {
+                view.AddNullifier(tx.claim_burn_txid,
+                                  NullifierEntry{static_cast<uint32_t>(pindex->nHeight), i});
+                blockundo.vNullifierKeys.push_back(tx.claim_burn_txid);
+                // D13d (SPEC §11.1): record the burn's Bitcoin
+                // median-time-past for the mint output, so Vigil spends can
+                // be gated on Bitcoin time. V3 placed the burn header at
+                // depth >= 144 below the committed tip, so its MTP is always
+                // computable here — fail closed if it somehow is not.
+                CBlockHeader burnHeader;
+                try {
+                    DataStream ds{std::as_bytes(std::span{tx.claim_burn_header})};
+                    ds >> burnHeader;
+                } catch (const std::exception&) {
+                    state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-claim-burnheader-parse",
+                                  "claim burn header does not parse");
+                    break;
+                }
+                const std::optional<uint32_t> burn_mtp{
+                    ::g_btcHeaderChain.GetMedianTimePast(burnHeader.GetHash())};
+                if (!burn_mtp.has_value()) {
+                    state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-claim-burn-mtp",
+                                  "burn header Bitcoin MTP not computable");
+                    break;
+                }
+                view.AddVigilMtp(COutPoint(tx.GetHash(), 0), *burn_mtp);
+            }
+        }
+    }
+
     CAmount blockReward = nFees + GetBlockSubsidy(pindex->nHeight, params.GetConsensus());
-    if (block.vtx[0]->GetValueOut() > blockReward && state.IsValid()) {
+    if (params.GetConsensus().fZeroSubsidy) {
+        // Favilla SPEC §1: subsidy is 0 for all heights; the coinbase MUST
+        // have value == total fees of the block's non-coinbase transactions.
+        if (block.vtx[0]->GetValueOut() != nFees && state.IsValid()) {
+            state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-cb-amount",
+                          strprintf("coinbase must equal total fees (actual=%d vs fees=%d)",
+                                    block.vtx[0]->GetValueOut(), nFees));
+        }
+    } else if (block.vtx[0]->GetValueOut() > blockReward && state.IsValid()) {
         state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-cb-amount",
                       strprintf("coinbase pays too much (actual=%d vs limit=%d)", block.vtx[0]->GetValueOut(), blockReward));
     }
@@ -2986,9 +3254,21 @@ bool Chainstate::DisconnectTip(BlockValidationState& state, DisconnectedBlockTra
     if (disconnectpool && m_mempool) {
         // Save transactions to re-add to mempool at end of reorg. If any entries are evicted for
         // exceeding memory limits, remove them and their descendants from the mempool.
-        for (auto&& evicted_tx : disconnectpool->AddTransactionsFromBlock(block.vtx)) {
+        // Favilla SPEC §13.1: disconnected version-4 claims are dropped, not
+        // re-queued — their mint output commits to the old inclusion height
+        // (§7 V6) and can never validate at the new height. The burn's
+        // nullifier entry was removed by DisconnectBlock, so the wallet can
+        // re-issue a fresh claim.
+        std::vector<CTransactionRef> requeue;
+        requeue.reserve(block.vtx.size());
+        for (const auto& ptx : block.vtx) {
+            if (!ptx->IsClaim()) requeue.push_back(ptx);
+        }
+        for (auto&& evicted_tx : disconnectpool->AddTransactionsFromBlock(requeue)) {
             m_mempool->removeRecursive(*evicted_tx, MemPoolRemovalReason::REORG);
         }
+        // The tip advanced (moved back): evict stale mempool claims (SPEC §10).
+        m_mempool->removeClaims();
     }
 
     m_chain.SetTip(*pindexDelete->pprev);
@@ -3119,6 +3399,9 @@ bool Chainstate::ConnectTip(
     // Remove conflicting transactions from the mempool.;
     if (m_mempool) {
         m_mempool->removeForBlock(block_to_connect->vtx, pindexNew->nHeight);
+        // Favilla SPEC §10: claims are valid for exactly one height — evict
+        // all mempool claims whenever the chain tip advances.
+        m_mempool->removeClaims();
         disconnectpool.removeForBlock(block_to_connect->vtx);
     }
     // Update m_chain & related variables.
@@ -4002,6 +4285,14 @@ bool CheckBlock(const CBlock& block, BlockValidationState& state, const Consensu
         if (block.vtx[i]->IsCoinBase())
             return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-cb-multiple", "more than one coinbase");
 
+    // Favilla: the coinbase must be version 1 or 2; a version-4 claim must
+    // never appear at position 0 (SPEC §5).
+    if (consensusParams.fZeroSubsidy &&
+        (block.vtx[0]->version != 1 && block.vtx[0]->version != 2)) {
+        return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-cb-version",
+                             "coinbase version must be 1 or 2");
+    }
+
     // Check transactions
     // Must check for duplicate inputs (see CVE-2018-17144)
     for (const auto& tx : block.vtx) {
@@ -4203,6 +4494,35 @@ static bool ContextualCheckBlock(const CBlock& block, BlockValidationState& stat
         if (block.vtx[0]->vin[0].scriptSig.size() < expect.size() ||
             !std::equal(expect.begin(), expect.end(), block.vtx[0]->vin[0].scriptSig.begin())) {
             return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-cb-height", "block height mismatch in coinbase");
+        }
+    }
+
+    // Favilla D13a (SPEC §1.1): every block at height >= 1 commits to its
+    // Bitcoin validation tip in the coinbase — exactly one output with
+    // scriptPubKey 0x6a 0x20 || H (H = 32-byte tip hash, internal byte
+    // order), value 0, covered by the coinbase -> Merkle root. The genesis
+    // block (height 0) is exempt (fixed §4 test vector).
+    if (chainman.GetConsensus().fZeroSubsidy && nHeight >= 1) {
+        const Favilla::BlockCommitment commitment{Favilla::GetBlockCommitment(block)};
+        if (commitment.count != 1) {
+            return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-cb-commitment-count",
+                                 "coinbase must carry exactly one Bitcoin-tip commitment output (D13a)");
+        }
+        if (commitment.value != 0) {
+            return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-cb-commitment-value",
+                                 "Bitcoin-tip commitment output must have value 0");
+        }
+        if (commitment.tip.IsNull()) {
+            // The zero hash means "no tip": permitted only for blocks whose
+            // validity does not depend on Bitcoin state. Any version-4 claim
+            // makes such a block INVALID (V3 cannot be evaluated).
+            for (const auto& tx : block.vtx) {
+                if (tx->IsClaim()) {
+                    return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
+                                         "bad-cb-commitment-zero-with-claims",
+                                         "block commits to the zero Bitcoin tip but contains a claim");
+                }
+            }
         }
     }
 

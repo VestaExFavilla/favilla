@@ -14,7 +14,7 @@ std::string ChainTypeToString(ChainType chain)
     case ChainType::MAIN:
         return "main";
     case ChainType::TESTNET:
-        return "test";
+        return "testnet";
     case ChainType::TESTNET4:
         return "testnet4";
     case ChainType::SIGNET:
@@ -29,7 +29,8 @@ std::optional<ChainType> ChainTypeFromString(std::string_view chain)
 {
     if (chain == "main") {
         return ChainType::MAIN;
-    } else if (chain == "test") {
+    } else if (chain == "testnet" || chain == "test") {
+        // "test" is kept as a deprecated alias for "testnet".
         return ChainType::TESTNET;
     } else if (chain == "testnet4") {
         return ChainType::TESTNET4;

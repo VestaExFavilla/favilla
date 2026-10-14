@@ -73,11 +73,11 @@ private:
     mutable std::vector<CacheCoinSnapshot> m_expected_snapshot{ComputeCacheCoinsSnapshot()};
 
 public:
-    void BatchWrite(CoinsViewCacheCursor& cursor, const uint256& block_hash) override
+    void BatchWrite(CoinsViewCacheCursor& cursor, const uint256& block_hash, const NullifierMap& nullifiers, const VigilMtpMap& vigilMtps) override
     {
         // Nothing must modify cacheCoins other than BatchWrite.
         assert(ComputeCacheCoinsSnapshot() == m_expected_snapshot);
-        CCoinsViewCache::BatchWrite(cursor, block_hash);
+        CCoinsViewCache::BatchWrite(cursor, block_hash, nullifiers, vigilMtps);
         m_expected_snapshot = ComputeCacheCoinsSnapshot();
     }
 
@@ -211,7 +211,7 @@ void TestCoinsView(FuzzedDataProvider& fuzzed_data_provider, CCoinsViewCache& co
                 if (fuzzed_data_provider.ConsumeBool()) best_block = ConsumeUInt256(fuzzed_data_provider);
                 // Set best block hash to non-null to satisfy the assertion in CCoinsViewDB::BatchWrite().
                 if (is_db && best_block.IsNull()) best_block = uint256::ONE;
-                coins_view_cache.BatchWrite(cursor, best_block);
+                coins_view_cache.BatchWrite(cursor, best_block, {}, {});
             });
     }
 

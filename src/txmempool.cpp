@@ -6,6 +6,7 @@
 #include <txmempool.h>
 
 #include <chain.h>
+#include <favilla/favilla.h>
 #include <coins.h>
 #include <common/system.h>
 #include <consensus/consensus.h>
@@ -236,7 +237,12 @@ void CTxMemPool::addNewTransaction(CTxMemPool::txiter newit)
     cachedInnerUsage += entry.DynamicMemoryUsage();
 
     const CTransaction& tx = newit->GetTx();
+    // Favilla: claims carry a null marker input that spends no coin. Do not
+    // track it in mapNextTx — all claims share the same null prevout, and
+    // tracking it would falsely flag claims as double-spends of each other.
+    const bool is_claim{tx.version == Favilla::TX_VERSION_CLAIM};
     for (unsigned int i = 0; i < tx.vin.size(); i++) {
+        if (is_claim) continue;
         mapNextTx.insert(std::make_pair(&tx.vin[i].prevout, newit));
     }
     // Don't bother worrying about child transactions of this one.
@@ -281,8 +287,11 @@ void CTxMemPool::removeUnchecked(txiter it, MemPoolRemovalReason reason)
         std::chrono::duration_cast<std::chrono::duration<std::uint64_t>>(it->GetTime()).count()
     );
 
-    for (const CTxIn& txin : it->GetTx().vin)
+    for (const CTxIn& txin : it->GetTx().vin) {
+        // Favilla: the claim marker input was never added to mapNextTx.
+        if (it->GetTx().version == Favilla::TX_VERSION_CLAIM) continue;
         mapNextTx.erase(txin.prevout);
+    }
 
     RemoveUnbroadcastTx(it->GetTx().GetHash(), true /* add logging because unchecked */);
 
@@ -327,6 +336,35 @@ void CTxMemPool::removeRecursive(CTxMemPool::txiter to_remove, MemPoolRemovalRea
     auto descendants = m_txgraph->GetDescendants(*to_remove, TxGraph::Level::MAIN);
     for (auto tx: descendants) {
         removeUnchecked(mapTx.iterator_to(static_cast<const CTxMemPoolEntry&>(*tx)), reason);
+    }
+}
+
+bool CTxMemPool::HasClaimForBurn(const uint256& burn_txid) const
+{
+    AssertLockHeld(cs);
+    for (const auto& entry : mapTx) {
+        const CTransaction& tx{entry.GetTx()};
+        if (tx.version == Favilla::TX_VERSION_CLAIM && tx.claim_burn_txid == burn_txid) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void CTxMemPool::removeClaims()
+{
+    // Favilla SPEC §10: claims are valid for exactly one height; evict them
+    // all whenever the chain tip advances. Removal reason EXPIRY: the claims
+    // are height-expired, not conflicted.
+    AssertLockHeld(cs);
+    std::vector<CTransactionRef> claims;
+    for (const auto& entry : mapTx) {
+        if (entry.GetTx().version == Favilla::TX_VERSION_CLAIM) {
+            claims.push_back(entry.GetSharedTx());
+        }
+    }
+    for (const auto& ptx : claims) {
+        removeRecursive(*ptx, MemPoolRemovalReason::EXPIRY);
     }
 }
 
@@ -488,7 +526,12 @@ void CTxMemPool::check(const CCoinsViewCache& active_coins_tip, int64_t spendhei
 
         std::set<CTxMemPoolEntry::CTxMemPoolEntryRef, CompareIteratorByHash> setParentCheck;
         std::set<CTxMemPoolEntry::CTxMemPoolEntryRef, CompareIteratorByHash> setParentsStored;
+        // Favilla: claims carry a single null marker input that spends no coin.
+        // It is not in mapNextTx and has no backing UTXO — skip the input
+        // consistency checks for it.
+        const bool is_claim{tx.version == Favilla::TX_VERSION_CLAIM};
         for (const CTxIn &txin : tx.vin) {
+            if (is_claim) continue;
             // Check that every mempool transaction's inputs refer to available coins, or other mempool tx's.
             indexed_transaction_set::const_iterator it2 = mapTx.find(txin.prevout.hash);
             if (it2 != mapTx.end()) {
@@ -534,8 +577,12 @@ void CTxMemPool::check(const CCoinsViewCache& active_coins_tip, int64_t spendhei
         TxValidationState dummy_state; // Not used. CheckTxInputs() should always pass
         CAmount txfee = 0;
         assert(!tx.IsCoinBase());
-        assert(Consensus::CheckTxInputs(tx, dummy_state, mempoolDuplicate, spendheight, txfee));
-        for (const auto& input: tx.vin) mempoolDuplicate.SpendCoin(input.prevout);
+        // Favilla: claims are inputless by consensus — the marker input spends
+        // no coin, so there is no UTXO to check and nothing to mark spent.
+        if (!is_claim) {
+            assert(Consensus::CheckTxInputs(tx, dummy_state, mempoolDuplicate, spendheight, txfee));
+            for (const auto& input: tx.vin) mempoolDuplicate.SpendCoin(input.prevout);
+        }
         AddCoins(mempoolDuplicate, tx, std::numeric_limits<int>::max());
     }
     for (auto it = mapNextTx.cbegin(); it != mapNextTx.cend(); it++) {

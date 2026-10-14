@@ -64,7 +64,11 @@ class CBlockUndo
 public:
     std::vector<CTxUndo> vtxundo; // for all but the coinbase
 
-    SERIALIZE_METHODS(CBlockUndo, obj) { READWRITE(obj.vtxundo); }
+    // Favilla: burn txids whose nullifier entries this block added (SPEC §8).
+    // On disconnect, these keys are deleted, restoring the §8 invariant.
+    std::vector<uint256> vNullifierKeys;
+
+    SERIALIZE_METHODS(CBlockUndo, obj) { READWRITE(obj.vtxundo, obj.vNullifierKeys); }
 };
 
 #endif // BITCOIN_UNDO_H

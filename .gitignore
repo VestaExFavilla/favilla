@@ -27,3 +27,54 @@ target/
 /guix-build-*
 
 /ci/scratch/
+# Favilla additions to the fork's .gitignore.
+# The publish step appends this block to the Bitcoin Core tree's existing
+# .gitignore at repo root (or applies it as-is if the root file is regenerated).
+# Nothing here is optional: every entry is either key material, a credential,
+# a datadir, or a build artifact that must never reach the public repo.
+
+### Favilla secrets and private material — NEVER PUBLIC
+hidden_files/
+testnet-burn-key-*.json
+*key*.json
+*.pem
+*.key
+wallet.dat
+*.wif
+upstream-node.txt
+*.env
+favilla.conf
+bitcoin.conf
+
+### Favilla datadirs and chain state
+.favilla/
+btc-testnet4/
+favilla-claim-*/
+favilla_btcheaders.dat
+testnet-feed/upstream/
+testnet-feed/headers-*.hex
+testnet-feed/headers-*.txt
+testnet-feed/*.log
+testnet-feed/upstream-*.json
+
+### Operator scratch
+testnet-claim-5b/
+testnet-claim-5a/
+*.log
+state.json
+poll*.log
+
+### Build artifacts and caches
+build/
+__pycache__/
+*.pyc
+*.pyo
+*.o
+*.a
+*.so
+*.dat
+*.tmp
+*~
+
+### Ephemeral host config
+/etc/favilla/

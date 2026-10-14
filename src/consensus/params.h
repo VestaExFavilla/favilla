@@ -136,6 +136,15 @@ struct Params {
     bool signet_blocks{false};
     std::vector<uint8_t> signet_challenge;
 
+    /**
+     * Favilla: block subsidy is identically zero for all heights; the coinbase
+     * of a block must have value == total fees of the block's non-coinbase
+     * transactions, and the coinbase must be version 1 or 2 (SPEC §1, §5).
+     * Issuance happens only through burn claims. False for all upstream
+     * networks; true for the Favilla regtest prototype chain.
+     */
+    bool fZeroSubsidy{false};
+
     int DeploymentHeight(BuriedDeployment dep) const
     {
         switch (dep) {

@@ -184,6 +184,8 @@ add_library(bitcoin_node STATIC EXCLUDE_FROM_ALL
   consensus/tx_verify.cpp
   dbwrapper.cpp
   deploymentstatus.cpp
+  favilla/btcheaders.cpp
+  favilla/claim.cpp
   flatfile.cpp
   headerssync.cpp
   httprpc.cpp

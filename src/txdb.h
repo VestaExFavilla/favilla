@@ -50,7 +50,10 @@ public:
     bool HaveCoin(const COutPoint &outpoint) const override;
     uint256 GetBestBlock() const override;
     std::vector<uint256> GetHeadBlocks() const override;
-    void BatchWrite(CoinsViewCacheCursor& cursor, const uint256& hashBlock) override;
+    void BatchWrite(CoinsViewCacheCursor& cursor, const uint256& hashBlock,
+                    const NullifierMap& nullifiers, const VigilMtpMap& vigilMtps) override;
+    std::optional<NullifierEntry> GetNullifier(const uint256& burn_txid) const override;
+    std::optional<uint32_t> GetVigilMtp(const COutPoint& outpoint) const override;
     std::unique_ptr<CCoinsViewCursor> Cursor() const override;
 
     //! Whether an unsupported database format is used.
